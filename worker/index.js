@@ -13,12 +13,189 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Credentials': 'true',
 };
 
-// Utility to create SHA-256 hex string
+// Utility to convert ArrayBuffer / Uint8Array to hex
+function bufToHex(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Utility to convert hex string to Uint8Array
+function hexToBuf(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
+
+// Constant-time string comparison to prevent timing attacks
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+// Legacy SHA-256 hex string (for backward compatibility)
 async function sha256(text) {
   const msgUint8 = new TextEncoder().encode(text);
   const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  return bufToHex(hashBuffer);
+}
+
+// =============================================================
+// PBKDF2 Password Hashing & Verification (Cloudflare Workers native Web Crypto)
+// OWASP standard: PBKDF2 with HMAC-SHA-256, 100,000 iterations, 16-byte cryptographic salt
+// Format: pbkdf2$sha256$100000$<saltHex>$<derivedKeyHex>
+// =============================================================
+const PBKDF2_ITERATIONS = 100000;
+const PBKDF2_SALT_BYTES = 16;
+const PBKDF2_KEY_BYTES = 32; // 256 bits
+
+async function hashPassword(password, saltHex = null, iterations = PBKDF2_ITERATIONS) {
+  const encoder = new TextEncoder();
+  const passwordBytes = encoder.encode(password);
+
+  let saltBytes;
+  if (saltHex) {
+    saltBytes = hexToBuf(saltHex);
+  } else {
+    saltBytes = new Uint8Array(PBKDF2_SALT_BYTES);
+    crypto.getRandomValues(saltBytes);
+  }
+
+  const baseKey = await crypto.subtle.importKey(
+    'raw',
+    passwordBytes,
+    { name: 'PBKDF2' },
+    false,
+    ['deriveBits']
+  );
+
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: 'PBKDF2',
+      salt: saltBytes,
+      iterations: iterations,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    PBKDF2_KEY_BYTES * 8
+  );
+
+  const finalSaltHex = bufToHex(saltBytes);
+  const derivedHex = bufToHex(derivedBits);
+  return `pbkdf2$sha256$${iterations}$${finalSaltHex}$${derivedHex}`;
+}
+
+async function verifyPassword(password, storedHash) {
+  if (!password || !storedHash) return false;
+
+  // Salted PBKDF2 format: pbkdf2$sha256$<iter>$<saltHex>$<derivedHex> (supports $ and : delimiters)
+  if (storedHash.startsWith('pbkdf2$') || storedHash.startsWith('pbkdf2:')) {
+    const delim = storedHash.includes('$') ? '$' : ':';
+    const parts = storedHash.split(delim);
+    if (parts.length >= 5) {
+      const iterations = parseInt(parts[2], 10) || PBKDF2_ITERATIONS;
+      const saltHex = parts[3];
+      const expectedKeyHex = parts[4];
+      const recomputed = await hashPassword(password, saltHex, iterations);
+      const recomputedParts = recomputed.split('$');
+      return timingSafeEqual(recomputedParts[4], expectedKeyHex);
+    }
+  }
+
+  // Legacy SHA-256 fallback (64 hex characters) for existing database records
+  if (/^[a-f0-9]{64}$/i.test(storedHash)) {
+    const rawHash = await sha256(password);
+    return timingSafeEqual(rawHash.toLowerCase(), storedHash.toLowerCase());
+  }
+
+  return false;
+}
+
+// Generate cryptographically secure session token (256-bit entropy)
+function generateSessionToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return bufToHex(bytes);
+}
+
+// =============================================================
+// RATE LIMITING (5 failed attempts per 15 min, 15 min lockout)
+// =============================================================
+const RATE_LIMIT_MAX_ATTEMPTS = 5;
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const RATE_LIMIT_LOCKOUT_MS = 15 * 60 * 1000;
+
+async function checkRateLimit(db, clientKey) {
+  try {
+    const row = await db.prepare(
+      `SELECT attempts, first_attempt_at, blocked_until FROM auth_rate_limits WHERE key = ?`
+    ).bind(clientKey).first();
+
+    if (!row) return { allowed: true, remaining: RATE_LIMIT_MAX_ATTEMPTS };
+
+    const now = Date.now();
+    if (row.blocked_until && row.blocked_until > now) {
+      const remainingSeconds = Math.ceil((row.blocked_until - now) / 1000);
+      return { allowed: false, remainingSeconds };
+    }
+
+    // Reset expired window
+    if (now - row.first_attempt_at > RATE_LIMIT_WINDOW_MS) {
+      await db.prepare(`DELETE FROM auth_rate_limits WHERE key = ?`).bind(clientKey).run();
+      return { allowed: true, remaining: RATE_LIMIT_MAX_ATTEMPTS };
+    }
+
+    if (row.attempts >= RATE_LIMIT_MAX_ATTEMPTS) {
+      const blockedUntil = now + RATE_LIMIT_LOCKOUT_MS;
+      await db.prepare(
+        `UPDATE auth_rate_limits SET blocked_until = ? WHERE key = ?`
+      ).bind(blockedUntil, clientKey).run();
+      return { allowed: false, remainingSeconds: Math.ceil(RATE_LIMIT_LOCKOUT_MS / 1000) };
+    }
+
+    return { allowed: true, remaining: RATE_LIMIT_MAX_ATTEMPTS - row.attempts };
+  } catch (e) {
+    console.error('Rate limit check error:', e);
+    return { allowed: true, remaining: RATE_LIMIT_MAX_ATTEMPTS };
+  }
+}
+
+async function recordFailedAttempt(db, clientKey) {
+  try {
+    const now = Date.now();
+    const row = await db.prepare(
+      `SELECT attempts, first_attempt_at FROM auth_rate_limits WHERE key = ?`
+    ).bind(clientKey).first();
+
+    if (!row || (now - row.first_attempt_at > RATE_LIMIT_WINDOW_MS)) {
+      await db.prepare(
+        `INSERT OR REPLACE INTO auth_rate_limits (key, attempts, first_attempt_at, blocked_until)
+         VALUES (?, 1, ?, 0)`
+      ).bind(clientKey, now).run();
+    } else {
+      const newAttempts = row.attempts + 1;
+      const blockedUntil = newAttempts >= RATE_LIMIT_MAX_ATTEMPTS ? now + RATE_LIMIT_LOCKOUT_MS : 0;
+      await db.prepare(
+        `UPDATE auth_rate_limits SET attempts = ?, blocked_until = ? WHERE key = ?`
+      ).bind(newAttempts, blockedUntil, clientKey).run();
+    }
+  } catch (e) {
+    console.error('Record failed attempt error:', e);
+  }
+}
+
+async function clearRateLimit(db, clientKey) {
+  try {
+    await db.prepare(`DELETE FROM auth_rate_limits WHERE key = ?`).bind(clientKey).run();
+  } catch (e) {
+    console.error('Clear rate limit error:', e);
+  }
 }
 
 // JSON Response helper
@@ -129,6 +306,20 @@ export default {
         const body = await request.json();
         const { email, password, turnstileToken } = body;
 
+        const clientIp = request.headers.get('CF-Connecting-IP') || '127.0.0.1';
+        const normEmail = String(email || '').trim().toLowerCase();
+        const rateLimitKey = `${clientIp}:${normEmail || 'anonymous'}`;
+
+        // Rate limiting check (5 attempts / 15 min window, 15 min lockout)
+        const rateCheck = await checkRateLimit(env.DB, rateLimitKey);
+        if (!rateCheck.allowed) {
+          const waitMins = Math.ceil(rateCheck.remainingSeconds / 60);
+          return json({
+            error: `Too many failed login attempts. Access temporarily restricted. Please try again in ${waitMins} minute(s).`,
+            retry_after: rateCheck.remainingSeconds
+          }, 429, { ...cors, 'Retry-After': String(rateCheck.remainingSeconds) });
+        }
+
         // Verify Turnstile if key is configured
         if (env.TURNSTILE_SECRET_KEY && turnstileToken) {
           const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
@@ -137,7 +328,7 @@ export default {
             body: new URLSearchParams({
               secret: env.TURNSTILE_SECRET_KEY,
               response: turnstileToken,
-              remoteip: request.headers.get('CF-Connecting-IP') || '',
+              remoteip: clientIp,
             }),
           });
           const verifyData = await verifyRes.json();
@@ -150,18 +341,20 @@ export default {
           return json({ error: 'Email and password are required.' }, 400, cors);
         }
 
-        const normEmail = String(email).trim().toLowerCase();
-        const pwdHash = await sha256(password);
-
         let user = null;
         let isSuperAdmin = false;
 
         // Check Cloudflare Worker Secrets for SaaS Owner / Superadmin
         const secretOwnerEmail = env.OWNER_ADMIN_EMAIL ? String(env.OWNER_ADMIN_EMAIL).trim().toLowerCase() : '';
-        const secretOwnerHash = env.OWNER_ADMIN_PASSWORD_HASH ? String(env.OWNER_ADMIN_PASSWORD_HASH).trim() : '';
+        const secretOwnerHash = env.OWNER_ADMIN_PBKDF2_HASH || env.OWNER_ADMIN_PASSWORD_HASH || '';
 
         if (secretOwnerEmail && normEmail === secretOwnerEmail) {
-          if (pwdHash !== secretOwnerHash) {
+          if (!secretOwnerHash) {
+            return json({ error: 'Owner account is not yet configured. Please set Cloudflare Worker secrets.' }, 503, cors);
+          }
+          const valid = await verifyPassword(password, secretOwnerHash);
+          if (!valid) {
+            await recordFailedAttempt(env.DB, rateLimitKey);
             return json({ error: 'Invalid Super Admin credentials.' }, 401, cors);
           }
           isSuperAdmin = true;
@@ -184,16 +377,27 @@ export default {
              WHERE lower(u.email) = ? AND u.status = 'ACTIVE'`
           ).bind(normEmail).first();
 
-          if (!user || user.password_hash !== pwdHash) {
+          if (!user) {
+            await recordFailedAttempt(env.DB, rateLimitKey);
             return json({ error: 'Invalid email or password.' }, 401, cors);
           }
+
+          const valid = await verifyPassword(password, user.password_hash);
+          if (!valid) {
+            await recordFailedAttempt(env.DB, rateLimitKey);
+            return json({ error: 'Invalid email or password.' }, 401, cors);
+          }
+
           if (user.role_name === 'super') {
             isSuperAdmin = true;
           }
         }
 
-        // Generate Session Token (24h validity)
-        const sessionToken = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+        // On successful authentication, reset failed attempts counter
+        await clearRateLimit(env.DB, rateLimitKey);
+
+        // Generate cryptographically secure Session Token (256-bit entropy)
+        const sessionToken = generateSessionToken();
         const role = user.role_name || (isSuperAdmin ? 'super' : 'admin');
         const site = user.site_code || 'HO';
         const siteName = user.site_name || 'Head Office';
@@ -451,7 +655,7 @@ export default {
         const plan = await env.DB.prepare(`SELECT * FROM saas_plans WHERE id = ?`).bind(planId).first();
         const monthlyPrice = plan?.monthly_price_inr || 3999;
 
-        const pwdHash = await sha256(adminPassword);
+        const pwdHash = await hashPassword(adminPassword);
         const startDate = new Date().toISOString().slice(0, 10);
         const renewalDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const mobileNum = contactPhone || ('9' + Math.floor(100000000 + Math.random() * 900000000));
