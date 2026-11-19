@@ -955,3 +955,33 @@ body.in-owner-portal{background:#f4f7fb!important;color:#17243a!important}
 
 /* Corrected topbar shadow syntax */
 .portal-topbar{box-shadow:0 4px 20px rgba(15,35,65,.025)}
+
+
+/* FIX: Owner Portal must escape the HRMS shell's two-column app grid. */
+html:not(.embed) body.in-owner-portal #app {
+  display: block !important;
+  grid-template-columns: none !important;
+  width: 100% !important;
+  max-width: none !important;
+  min-height: 100vh !important;
+  margin: 0 !important;
+}
+html:not(.embed) body.in-owner-portal #app > * {
+  width: 100% !important;
+  max-width: none !important;
+}
+body.in-owner-portal .mn {
+  width: 100% !important;
+  max-width: none !important;
+  min-width: 0 !important;
+}
+body.in-owner-portal .portal-layout {
+  width: 100% !important;
+  max-width: none !important;
+  min-width: 0 !important;
+}
+body.in-owner-portal .portal-main {
+  width: calc(100% - 258px) !important;
+  flex: 1 1 auto !important;
+  min-width: 0 !important;
+}
