@@ -894,28 +894,25 @@ body.in .ep-do .danger{background:#FDECEE;border-color:#F9D0D5;color:#B20018;bor
   function toggleOwnerPortal(open) {
     var portalSec = $('p_saas_portal');
     var hrmsView = $('client_hrms_view');
-    var toggleBtn = $('btn_toggle_owner_portal');
-    if (!portalSec || !hrmsView) return;
+    var side = $('side');
+    var bar = document.querySelector('.mn > .bar');
+    if (!portalSec) return;
 
     if (open) {
+      document.body.classList.add('in-owner-portal');
       portalSec.hidden = false;
-      hrmsView.hidden = true;
-      if (toggleBtn) {
-        toggleBtn.style.background = '#10B981';
-        toggleBtn.querySelector('span:last-child').textContent = 'Open Client HRMS ➔';
-        toggleBtn.onclick = function () { toggleOwnerPortal(false); };
-      }
+      if (hrmsView) hrmsView.hidden = true;
+      if (side) side.style.display = 'none';
+      if (bar) bar.style.display = 'none';
       if (window.SAAS_PORTAL) {
         window.SAAS_PORTAL.open(portalSec);
       }
     } else {
+      document.body.classList.remove('in-owner-portal');
       portalSec.hidden = true;
-      hrmsView.hidden = false;
-      if (toggleBtn) {
-        toggleBtn.style.background = '#0A1B44';
-        toggleBtn.querySelector('span:last-child').textContent = 'SaaS Owner Central';
-        toggleBtn.onclick = function () { toggleOwnerPortal(true); };
-      }
+      if (hrmsView) hrmsView.hidden = false;
+      if (side) side.style.display = '';
+      if (bar) bar.style.display = '';
       if (window.HR) {
         window.HR.open(S.me, 'employees');
       }
