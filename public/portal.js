@@ -581,6 +581,7 @@
           '<td style="text-align:right;white-space:nowrap;">' +
             '<button class="portal-btn-icon view-client-btn" data-id="' + c.id + '" title="View Organization Details" style="margin-right:6px;">👁️</button>' +
             '<button class="portal-btn-icon edit-client-btn" data-id="' + c.id + '" title="Edit Organization" style="margin-right:6px;">✏️</button>' +
+            (c.id === 'org_oneclick_01' || c.code === 'HO' ? '' : '<button class="portal-btn-icon toggle-client-status-btn" data-id="' + c.id + '" data-name="' + c.name + '" data-status="' + c.status + '" title="' + (c.status === 'ACTIVE' ? 'Deactivate Client' : 'Reactivate Client') + '" style="margin-right:6px;">' + (c.status === 'ACTIVE' ? '⏸️' : '▶️') + '</button>') +
             '<button class="portal-btn-icon impersonate-client-btn" data-id="' + c.id + '" data-name="' + c.name + '" title="Open Client HRMS">🚀</button>' +
           '</td>';
 
@@ -604,6 +605,28 @@
     card.querySelectorAll('.edit-client-btn').forEach(function (btn) {
       btn.onclick = function () {
         showEditClientModal(btn.dataset.id);
+      };
+    });
+
+    card.querySelectorAll('.toggle-client-status-btn').forEach(function (btn) {
+      btn.onclick = function () {
+        var orgId = btn.dataset.id;
+        var orgName = btn.dataset.name;
+        var currentStatus = btn.dataset.status;
+        var nextStatus = currentStatus === 'ACTIVE' ? 'SUSPENDED' : 'ACTIVE';
+        var actionLabel = nextStatus === 'SUSPENDED' ? 'DEACTIVATE' : 'REACTIVATE';
+        var message = nextStatus === 'SUSPENDED'
+          ? 'Deactivate "' + orgName + '"?\n\nThe client login and access will be blocked. All data will remain untouched and can be restored by reactivating.'
+          : 'Reactivate "' + orgName + '"?\n\nThe client will regain access to their HRMS.';
+        if (!confirm(message)) return;
+        btn.disabled = true;
+        api('/api/portal/clients/' + orgId, 'PATCH', { status: nextStatus }).then(function () {
+          toast(orgName + ' ' + (nextStatus === 'SUSPENDED' ? 'deactivated' : 'reactivated') + ' successfully');
+          loadClients().then(function () { refreshView(); });
+        }).catch(function (err) {
+          btn.disabled = false;
+          toast(err.message, true);
+        });
       };
     });
 
