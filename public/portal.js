@@ -133,7 +133,7 @@
     var brand = el('div', 'portal-sidebar-brand');
     brand.innerHTML =
       '<div class="portal-brand-wrap">' +
-        '<img class="portal-brand-logo" src="oneclick-logo-icon.png" alt="OneClick Solution logo">' +
+        '<img class="portal-brand-logo" src="oneclick-logo.svg" alt="OneClick Solution logo">' +
         '<div>' +
           '<div class="portal-brand-title">OneClick <span>HRMS</span></div>' +
           '<div class="portal-brand-badge">SaaS Owner Portal</div>' +
