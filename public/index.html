@@ -6,7 +6,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title>HR – Sketchline</title>
+<title>ONECLICK HRMS – Enterprise Multi-Tenant Human Resource Management System</title>
 <link rel="icon" href="favicon.png">
 <style>
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#F3F6FB;color:#0E1116;font-family:"Segoe UI",system-ui,-apple-system,Roboto,"Noto Sans Devanagari",Arial,sans-serif;padding:20px}
@@ -432,24 +432,70 @@ body.in .ep-do .danger{background:#FDECEE;border-color:#F9D0D5;color:#B20018;bor
 @media(max-width:1000px){.rb{grid-template-columns:1fr}.rb-add{grid-template-columns:1fr 1fr}.rb-grid{grid-template-columns:1fr}}
 </style>
 <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
 </head>
 <body>
 <main class="card" id="start">
   <div class="ic" aria-hidden="true"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M16 4.8a3.2 3.2 0 0 1 0 6.4"/><path d="M18 14.3c1.8.8 3 2.6 3 4.7"/></svg></div>
-  <h1>HR</h1>
-  <p id="state">Opening…</p>
+  <h1>OneClick HRMS</h1>
+  <p id="state">Loading…</p>
+  <div id="login_box" style="margin-top:20px;text-align:left;display:none;">
+    <div style="margin-bottom:12px;">
+      <label for="l_email" style="display:block;font-size:14px;font-weight:600;margin-bottom:4px;color:#2A3550;">Email Address</label>
+      <input type="email" id="l_email" placeholder="admin@oneclicksolution.online" style="width:100%;height:44px;border:1px solid #D7E0EF;border-radius:12px;padding:0 12px;font-size:15px;background:#fff;" autocomplete="email" required>
+    </div>
+    <div style="margin-bottom:14px;">
+      <label for="l_pwd" style="display:block;font-size:14px;font-weight:600;margin-bottom:4px;color:#2A3550;">Password</label>
+      <input type="password" id="l_pwd" placeholder="Enter password" style="width:100%;height:44px;border:1px solid #D7E0EF;border-radius:12px;padding:0 12px;font-size:15px;background:#fff;" autocomplete="current-password" required>
+    </div>
+    <div id="turnstile_box" style="margin-bottom:14px;display:flex;justify-content:center;"></div>
+    <button type="button" id="btn_login" class="btn" style="width:100%;border:0;cursor:pointer;padding:12px;font-size:16px;">Sign In to HRMS</button>
+  </div>
   <ul><li>Employees</li><li>Attendance</li><li>Leave</li><li>Payroll</li></ul>
   <p class="who" id="who" hidden></p>
   <p class="bad" id="bad" role="alert" hidden></p>
-  <p id="go" hidden><a class="btn" id="link" href="#">Open the Portal</a></p>
+  <p id="go" hidden><a class="btn" id="link" href="#">Open Portal</a></p>
 </main>
 <div id="app" hidden>
-  <!-- (13-11-2026, the pictures he approved) the menu down the left side, the search (Ctrl K) and the site on top – in Mechanical's
-       screen and on a narrow screen the menu is the row of buttons as before -->
-  <aside class="sd" id="side"><div class="sd-brand"><span class="sd-lg"><img class="sd-logo" id="sd_logo" src="https://i.ibb.co/CpSfBqXX/RCL-LOGO-PDF.png" alt="Rachana Construction Limited"></span><span class="sd-sub">HR · Attendance · Payroll</span></div><nav id="tabs" aria-label="The pages of HR"></nav><div class="sd-foot" id="sd_foot"></div></aside>
+  <!-- ONECLICK HRMS Universal Sidebar & Modern Navigation -->
+  <aside class="sd" id="side">
+    <div class="sd-brand" style="padding:16px 14px 12px;border-bottom:1px solid #E3EAF6;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="34" height="34" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="40" height="40" rx="10" fill="#0A1B44"/>
+          <path d="M12 28V12L28 20L12 28Z" fill="#D2001A"/>
+          <circle cx="28" cy="20" r="4" fill="#38BDF8"/>
+        </svg>
+        <div>
+          <span style="font-weight:900;font-size:16.5px;letter-spacing:-0.3px;color:#0A1B44;display:block;line-height:1.1;">ONECLICK</span>
+          <span style="font-size:10.5px;font-weight:700;color:#D2001A;letter-spacing:1px;text-transform:uppercase;">HRMS Cloud</span>
+        </div>
+      </div>
+      <div id="sd_tenant_badge" style="margin-top:8px;font-size:12px;color:#334155;background:#F1F5F9;padding:4px 8px;border-radius:6px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
+    </div>
+    <div id="sd_owner_nav" style="padding:10px 12px 6px;" hidden>
+      <button type="button" id="btn_toggle_owner_portal" class="tab on" style="width:100%;text-align:left;background:#0A1B44;color:#fff;border-radius:12px;padding:9px 12px;display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:700;">
+        <span>👑</span> <span>SaaS Owner Central</span>
+      </button>
+    </div>
+    <nav id="tabs" aria-label="The pages of HR"></nav>
+    <div class="sd-foot" id="sd_foot"></div>
+  </aside>
   <div class="mn">
   <div class="nav-shade" id="nav_shade"></div>
-  <div class="bar"><button class="nav-tog" id="nav_tog" type="button" aria-label="Menu" aria-controls="side" aria-expanded="true"><i></i><i></i><i></i></button><button class="nav-back" id="nav_back" type="button" title="One step back (Alt + ←)" disabled><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>Back</button><button class="fd-open" id="find_open" type="button" aria-haspopup="dialog"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><span>Search a page, an employee, an action…</span><kbd>Ctrl K</kbd></button><select id="site_pick" class="dz-pill" aria-label="Site" hidden></select><select id="lang_pick" class="dz-pill" data-noi18n aria-label="Language of the web" title="Language of the web – for you only (the phone app has its own)" hidden><option value="en">English</option><option value="mr">मराठी</option><option value="hi">हिंदी</option></select><span class="who2" id="who2"></span><button class="top-b ask" id="ask_open" type="button" title="Ask how to do something in HR – in Marathi, Hindi or English" aria-controls="ask_panel" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12z"/><path d="M9.6 9.6a2.4 2.4 0 1 1 3.4 2.2c-.6.3-1 .9-1 1.6v.4"/><path d="M12 16.6h.01"/></svg>Ask</button><button class="top-b" id="go_erp" type="button" title="Back to the ERP of the site – Machinery, Store, Engineering, Purchase" hidden>‹ ERP</button><button class="top-b" id="go_portal" type="button" title="Back to the Portal – the other modules and sites" hidden>‹ Portal</button><button class="top-b out" id="log_out" type="button" title="Sign out of the ERP on this computer" hidden>Log out</button></div>
+  <div class="bar">
+    <button class="nav-tog" id="nav_tog" type="button" aria-label="Menu" aria-controls="side" aria-expanded="true"><i></i><i></i><i></i></button>
+    <button class="nav-back" id="nav_back" type="button" title="One step back (Alt + ←)" disabled><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>Back</button>
+    <button class="fd-open" id="find_open" type="button" aria-haspopup="dialog"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><span>Search a page, an employee, an action…</span><kbd>Ctrl K</kbd></button>
+    <select id="org_pick" class="dz-pill" style="font-weight:700;background:#EFF6FF;color:#1E40AF;border:1px solid #BFDBFE;" hidden title="Switch Client Organization"></select>
+    <select id="site_pick" class="dz-pill" aria-label="Site" hidden></select>
+    <select id="lang_pick" class="dz-pill" data-noi18n aria-label="Language of the web" title="Language of the web – for you only (the phone app has its own)" hidden><option value="en">English</option><option value="mr">मराठी</option><option value="hi">हिंदी</option></select>
+    <span class="who2" id="who2"></span>
+    <button class="top-b ask" id="ask_open" type="button" title="Ask how to do something in HR – in Marathi, Hindi or English" aria-controls="ask_panel" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12z"/><path d="M9.6 9.6a2.4 2.4 0 1 1 3.4 2.2c-.6.3-1 .9-1 1.6v.4"/><path d="M12 16.6h.01"/></svg>Ask</button>
+    <button class="top-b out" id="log_out" type="button" title="Sign out on this computer">Log out</button>
+  </div>
+  <section id="p_saas_portal" hidden style="margin-top:14px;"></section>
+  <div id="client_hrms_view">
   <div class="dz-top" id="p_head"><div><h2 id="p_title"></h2><small id="p_sub"></small></div><div class="dz-pills"><span id="p_tools" style="display:contents"></span></div></div>
   <nav class="bk-nav" id="p_booknav" aria-label="Rule Book" hidden></nav>
   <div id="all_box" hidden></div>
@@ -475,6 +521,7 @@ body.in .ep-do .danger{background:#FDECEE;border-color:#F9D0D5;color:#B20018;bor
   <section id="p_att" hidden></section>
   <section id="p_mus" hidden></section>
   <section id="p_mast" hidden><div id="m_two"></div></section>
+  </div>
   </div>
 </div>
 <!-- (13-11-2026) Ctrl K: one box that finds a page, an employee (name, code, mobile, e-mail), a department, a designation or an action – find.js -->
@@ -718,6 +765,7 @@ body.in .ep-do .danger{background:#FDECEE;border-color:#F9D0D5;color:#B20018;bor
 <script src="att.js"></script>
 <script src="mus.js"></script>
 <script src="allsites.js"></script>
+<script src="portal.js"></script>
 <script src="hr.js"></script>
 <script src="ask.js"></script>
 <script src="hsb.js"></script>
@@ -762,12 +810,78 @@ body.in .ep-do .danger{background:#FDECEE;border-color:#F9D0D5;color:#B20018;bor
     [en, mr, hi].forEach(function (t, i) { if (!t) return; if (i) b.appendChild(document.createElement('br')); b.appendChild(document.createTextNode(t)); });
     b.hidden = false; $('go').hidden = !(link && PORTAL); $('link').href = PORTAL ? PORTAL + '/' : '#'; if (EMBED) $('link').target = '_top';
   }
-  var ROLE = { super: 'Super Admin', admin: 'HR Admin', user: 'HR User' };
+  var ROLE = { super: 'SaaS Superadmin', admin: 'Client HR Admin', user: 'Client HR User', self: 'Employee' };
   function show(me) {
     S.me = me; PORTAL = me.portal || PORTAL; if (!AS) try { localStorage.setItem('rcl_hr_site', me.site); sessionStorage.removeItem('rcl_hr_hops'); } catch (e) { /* asked again next time */ }
     $('bad').hidden = true; $('go').hidden = true; $('state').hidden = false; $('state').textContent = BUILT;
+    
+    // Set Tenant Badge in sidebar
+    var tBadge = $('sd_tenant_badge');
+    if (tBadge) {
+      var orgName = me.organization?.name || 'ONECLICK HRMS';
+      tBadge.textContent = '🏢 ' + orgName;
+    }
+
     sitePick(me); langPick(me);
-    if (window.HR) { $('start').hidden = true; document.body.classList.add('in'); $('who2').textContent = me.user.name + ' · ' + (me.siteName || me.site) + ' · ' + (ROLE[me.user.role] || me.user.role); var sf = $('sd_foot'); sf.textContent = ''; var sb = document.createElement('b'); sb.textContent = me.siteName || me.site; sf.appendChild(sb); sf.appendChild(document.createTextNode(me.user.name + ' · ' + (ROLE[me.user.role] || me.user.role))); window.HR.open(me, hashArg('page')); }
+
+    // Superadmin SaaS Owner Central setup
+    var isSuper = me.user && me.user.role === 'super';
+    var ownerNav = $('sd_owner_nav');
+    var orgPick = $('org_pick');
+
+    if (isSuper) {
+      if (ownerNav) ownerNav.hidden = false;
+      if (orgPick && me.all_organizations && me.all_organizations.length) {
+        orgPick.textContent = '';
+        me.all_organizations.forEach(function (org) {
+          var opt = document.createElement('option');
+          opt.value = org.id;
+          opt.textContent = '🏢 ' + org.name + ' (' + org.code + ')';
+          if (org.id === me.organization?.id) opt.selected = true;
+          orgPick.appendChild(opt);
+        });
+        orgPick.hidden = false;
+        orgPick.onchange = function () {
+          var selOrgId = orgPick.value;
+          if (!selOrgId || selOrgId === me.organization?.id) return;
+          orgPick.disabled = true;
+          api('api/portal/switch-tenant', { organization_id: selOrgId }).then(function () {
+            location.reload();
+          }).catch(function (err) {
+            orgPick.disabled = false;
+            alert('Failed to switch tenant: ' + err.message);
+          });
+        };
+      }
+
+      var toggleBtn = $('btn_toggle_owner_portal');
+      if (toggleBtn) {
+        toggleBtn.onclick = function () {
+          toggleOwnerPortal(true);
+        };
+      }
+    }
+
+    // Determine initial view: if super and not specifically asking for an HR page, open Owner Central!
+    var targetPage = hashArg('page');
+    if (isSuper && (!targetPage || targetPage === 'portal')) {
+      $('start').hidden = true;
+      document.body.classList.add('in');
+      $('who2').textContent = me.user.name + ' · SaaS Owner · Super Admin';
+      toggleOwnerPortal(true);
+    } else {
+      if (window.HR) {
+        $('start').hidden = true;
+        document.body.classList.add('in');
+        $('who2').textContent = me.user.name + ' · ' + (me.siteName || me.site) + ' · ' + (ROLE[me.user.role] || me.user.role);
+        var sf = $('sd_foot'); sf.textContent = '';
+        var sb = document.createElement('b'); sb.textContent = me.siteName || me.site;
+        sf.appendChild(sb);
+        sf.appendChild(document.createTextNode(me.user.name + ' · ' + (ROLE[me.user.role] || me.user.role)));
+        window.HR.open(me, targetPage);
+      }
+    }
+
     outButtons();
     var ak = $('ask_open'); if (ak) { ak.hidden = !!AS || me.user.role === 'self' || !window.HRASK; ak.onclick = function () { window.HRASK.toggle(); }; }      // (19-11-2026) "Ask"
     var w = $('who'); w.textContent = ''; var b = document.createElement('b'); b.textContent = me.user.name; w.appendChild(b);
@@ -775,6 +889,37 @@ body.in .ep-do .danger{background:#FDECEE;border-color:#F9D0D5;color:#B20018;bor
     if (AS) return;      // ("All sites") the page around this one keeps the sign-in fresh
     if (window.HRALL) window.HRALL.start(hashArg('page') || 'dashboard');
     renewStart();
+  }
+
+  function toggleOwnerPortal(open) {
+    var portalSec = $('p_saas_portal');
+    var hrmsView = $('client_hrms_view');
+    var toggleBtn = $('btn_toggle_owner_portal');
+    if (!portalSec || !hrmsView) return;
+
+    if (open) {
+      portalSec.hidden = false;
+      hrmsView.hidden = true;
+      if (toggleBtn) {
+        toggleBtn.style.background = '#10B981';
+        toggleBtn.querySelector('span:last-child').textContent = 'Open Client HRMS ➔';
+        toggleBtn.onclick = function () { toggleOwnerPortal(false); };
+      }
+      if (window.SAAS_PORTAL) {
+        window.SAAS_PORTAL.open(portalSec);
+      }
+    } else {
+      portalSec.hidden = true;
+      hrmsView.hidden = false;
+      if (toggleBtn) {
+        toggleBtn.style.background = '#0A1B44';
+        toggleBtn.querySelector('span:last-child').textContent = 'SaaS Owner Central';
+        toggleBtn.onclick = function () { toggleOwnerPortal(true); };
+      }
+      if (window.HR) {
+        window.HR.open(S.me, 'employees');
+      }
+    }
   }
   /* THE SITE IS CHOSEN HERE TOO (12-11-2026: "HR MADHE PN SITE SELECT KARAYCHA OPTION DE"): the sites are the Portal's (VTR, HO,
    * 18B …) – HR only chooses among those where this person has HR. Another site = a new ticket of the Portal for it, then the
@@ -839,14 +984,13 @@ body.in .ep-do .danger{background:#FDECEE;border-color:#F9D0D5;color:#B20018;bor
     window.HRNAV = { picked: function () { if (isOpen()) set(false); }, open: function () { set(true); }, isOpen: isOpen };
   })();
   function outButtons() {
-    var gp = $('go_portal'), lo = $('log_out'); if (!gp || !lo) return; gp.hidden = lo.hidden = EMBED || !PORTAL;
-    // "‹ ERP": HR is served under the ERP's own address (<main>/hr/) – its start page is the ERP of the site
-    var ge = $('go_erp'), main = /\/hr\/$/.test(BASE) ? BASE.replace(/hr\/$/, '') : ''; if (ge) { ge.hidden = EMBED || !main; ge.onclick = function () { location.href = main; }; }
-    gp.onclick = function () { location.href = PORTAL + '/'; };
+    var lo = $('log_out'); if (!lo) return;
+    lo.hidden = false;
     lo.onclick = function () {
-      lo.disabled = gp.disabled = true; lo.textContent = 'Signing out…'; clearInterval(renewT); renewT = 0; S.me = null;
-      var away = function () { location.href = PORTAL + '/'; }, portalOut = function () { return fetch(PORTAL + '/api/auth', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-RCL': '1' }, body: JSON.stringify({ action: 'logout' }) }).catch(function () { /* the Portal asks for the sign-in anyway when its own has ended */ }); };
-      api('api/logout', {}).catch(function () { /* HR's sign-in ends by itself in 15 minutes */ }).then(portalOut).then(away, away);
+      lo.disabled = true; lo.textContent = 'Signing out…'; clearInterval(renewT); renewT = 0; S.me = null;
+      api('api/logout', {}).catch(function () {}).then(function () {
+        location.reload();
+      });
     };
   }
   function toPortal(path) {
@@ -921,23 +1065,64 @@ body.in .ep-do .danger{background:#FDECEE;border-color:#F9D0D5;color:#B20018;bor
     return api('api/me').then(function (me) {
       PORTAL = me.portal || '';
       if (me.signedIn && (!site || site === me.site) && (!who || who === String(me.user.email).toLowerCase())) return show(me);
-      var next = function () { var s = site || (me.signedIn ? me.site : '') || lastSite(); if (EMBED || s) return signIn(s, who); toPortal('/'); };
-      return me.signedIn ? api('api/logout', {}).catch(function () {}).then(next) : next();
+      if (EMBED || site) return signIn(site || (me.signedIn ? me.site : '') || lastSite(), who);
+      // Standalone Cloudflare Hosting: Show Direct Login Box
+      $('state').textContent = 'Please sign in to continue';
+      var lbox = $('login_box');
+      if (lbox) {
+        lbox.style.display = 'block';
+        var turnstileToken = '';
+        fetch('/api/turnstile-config').then(function(r) { return r.json(); }).then(function(c) {
+          if (c.siteKey && window.turnstile) {
+            window.turnstile.render('#turnstile_box', {
+              sitekey: c.siteKey,
+              callback: function(token) { turnstileToken = token; }
+            });
+          }
+        }).catch(function() {});
+        $('btn_login').onclick = function() {
+          var em = ($('l_email').value || '').trim();
+          var pw = ($('l_pwd').value || '');
+          if (!em || !pw) {
+            $('bad').textContent = 'Please enter both email and password.';
+            $('bad').hidden = false;
+            return;
+          }
+          $('btn_login').disabled = true;
+          $('btn_login').textContent = 'Signing In…';
+          $('bad').hidden = true;
+          fetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: em, password: pw, turnstileToken: turnstileToken })
+          }).then(function(res) { return res.json().then(function(j) { return { ok: res.ok, j: j }; }); })
+          .then(function(res) {
+            if (!res.ok || res.j.error) {
+              $('bad').textContent = res.j.error || 'Login failed.';
+              $('bad').hidden = false;
+              $('btn_login').disabled = false;
+              $('btn_login').textContent = 'Sign In to HRMS';
+              return;
+            }
+            location.reload();
+          }).catch(function(err) {
+            $('bad').textContent = err.message || 'Network error.';
+            $('bad').hidden = false;
+            $('btn_login').disabled = false;
+            $('btn_login').textContent = 'Sign In to HRMS';
+          });
+        };
+      }
     }, function (e) { msg(e.message, '', '', false); });
   }
   if (!OUT) start();      // (on its way to the whole window: nothing is asked from inside the frame)
 })();
 </script>
 <script>
-/* (14-11-2026, asked: "aple app ch name change kraych aahe ani logo pn – Sketchline Lion … super admin multiple changes kru shakel,
- * pratek weli code change krne garjech nahi") THE PRODUCT'S NAME comes from the Portal's "Branding" (rcl-portal /api/brand, at the one
- * address): asked once when the page opens. Until it answers – and where the Portal is not at this address – the built-in
- * "Sketchline" stays. It is written as text only. */
+// Universal ONECLICK HRMS Platform Branding
 (function () {
-  try { fetch('/portal/api/brand', { credentials: 'omit' }).then(function (r) { return r.ok ? r.json() : null; }).then(function (v) {
-    if (!v || typeof v.name !== 'string' || !v.name.trim()) return; var n = v.name.trim().slice(0, 60);
-    document.title = 'HR – ' + n; [].forEach.call(document.querySelectorAll('.pb-name'), function (e) { e.textContent = n; });
-  }).catch(function () {}); } catch (e) { /* the built-in name stays */ }
+  document.title = 'ONECLICK HRMS – Intelligent Multi-Tenant Human Resource Management System';
+  [].forEach.call(document.querySelectorAll('.pb-name'), function (e) { e.textContent = 'ONECLICK HRMS'; });
 })();
 </script>
 </body>

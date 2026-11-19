@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "oneclick-hrms-api",
+  "main": "worker/index.js",
+  "compatibility_date": "2024-11-19",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "oneclick-hrms-db",
+      "database_id": "10b0c631-0def-4d00-9cac-04b67bb2de28"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "HRMS_FILES",
+      "bucket_name": "oneclick-hrms-storage"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "api.oneclicksolution.online",
+      "custom_domain": true
+    }
+  ],
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS"
+  }
+}

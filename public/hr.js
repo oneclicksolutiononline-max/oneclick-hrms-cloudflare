@@ -561,7 +561,7 @@
     };
     if (/\.csv$/i.test(file.name)) { file.text().then(function (t) { done(csv(t.replace(/^﻿/, ''))); }); return; }
     xlsxLib().then(function (ok) {
-      if (!ok) return bad('An Excel file can be read only when HR is opened inside the ERP (lion.sketchline.si). Or save the sheet as CSV and choose that.');
+      if (!ok) return bad('An Excel file could not be parsed. Or save the sheet as CSV and choose that.');
       file.arrayBuffer().then(function (buf) { var wb = window.XLSX.read(buf, { type: 'array' }), sh = wb.Sheets[wb.SheetNames[0]]; S.impPart = window.HRSHEET ? window.HRSHEET.partOf(wb.SheetNames[0]) : ''; done(window.XLSX.utils.sheet_to_json(sh, { header: 1, raw: true, defval: '' })); }, function () { bad('The file could not be read.'); });
     });
   }

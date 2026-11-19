@@ -58,7 +58,7 @@
   function make(part, init) {
     var P = PARTS.filter(function (p) { return p.key === part; })[0];
     return Promise.all([lib(), api('sheetCols'), api('listAll').catch(function () { return { lists: {} }; }), P.no > 1 ? api('sheetExport', {}) : Promise.resolve(null)]).then(function (x) {
-      if (!x[0]) throw new Error('The Excel maker could not be loaded – open HR inside the ERP (lion.sketchline.si) and try again.');
+      if (!x[0]) throw new Error('The Excel maker could not be loaded. Please refresh and try again.');
       var heads = {}; x[1].cols.forEach(function (c) { heads[c.key] = c.head; }); var lists = (x[2] && x[2].lists) || {};
       var people = []; if (x[3]) { var ci = x[3].heads.indexOf(heads.code), ni = x[3].heads.indexOf(heads.name); x[3].rows.forEach(function (r) { if (r[ci]) people.push([r[ci], r[ni]]); }); }
       var active = function (l) { return (l || []).filter(function (v) { return v.active !== false; }).map(function (v) { return v.name; }); };
