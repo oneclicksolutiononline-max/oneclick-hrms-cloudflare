@@ -985,3 +985,61 @@ body.in-owner-portal .portal-main {
   flex: 1 1 auto !important;
   min-width: 0 !important;
 }
+
+/* ONECLICK SOLUTION BRAND REFRESH — premium owner portal */
+:root{
+ --portal-sidebar-bg:#071632;
+ --portal-sidebar-active:#5b35e8;
+ --portal-primary:#5b35e8;
+ --portal-primary-hover:#4822c8;
+ --portal-primary-light:#f0ebff;
+ --portal-accent:#ff7a00;
+ --portal-accent-hover:#e96900;
+ --portal-accent-light:#fff2e4;
+ --portal-bg:#f5f7ff;
+ --portal-card-bg:#fff;
+ --portal-text-main:#15223c;
+ --portal-text-muted:#687994;
+ --portal-border:#e3e8f4;
+ --portal-shadow-sm:0 3px 12px rgba(23,36,68,.045);
+ --portal-shadow-md:0 12px 30px rgba(23,36,68,.075);
+ --portal-radius:16px;
+}
+html:not(.embed) body.in-owner-portal #app{display:block!important;grid-template-columns:none!important;width:100%!important;max-width:none!important;min-height:100vh!important;margin:0!important}
+body.in-owner-portal #app>.mn,body.in-owner-portal .mn{width:100%!important;max-width:none!important;min-width:0!important;margin:0!important;padding:0!important}
+body.in-owner-portal .portal-layout{width:100%!important;max-width:none!important;min-width:0!important;background:linear-gradient(135deg,#f7f8ff 0%,#f1f5ff 100%);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+body.in-owner-portal .portal-sidebar{width:260px;background:linear-gradient(180deg,#071632 0%,#101e42 65%,#171a47 100%);box-shadow:7px 0 28px rgba(8,18,45,.08)}
+.portal-sidebar-brand{padding:20px 17px 18px}
+.portal-brand-wrap{gap:10px}
+.portal-brand-logo{width:43px;height:43px;object-fit:contain;flex:none;filter:drop-shadow(0 5px 8px rgba(0,0,0,.14))}
+.portal-brand-title{font-size:18px;letter-spacing:-.55px}
+.portal-brand-title span{color:#ff7a00}
+.portal-brand-badge{background:rgba(91,53,232,.22);border-color:rgba(155,135,255,.22);color:#c9bcff;font-size:9.5px;letter-spacing:.65px}
+.portal-sidebar-nav{padding:16px 11px;gap:5px}
+.portal-nav-item{border-radius:11px;padding:11px 12px;font-size:13px;color:#aab8d4}
+.portal-nav-item.active{background:linear-gradient(100deg,#5630e8,#7a54ff);box-shadow:0 7px 18px rgba(86,48,232,.25)}
+.portal-nav-item svg{width:18px;height:18px}
+body.in-owner-portal .portal-main{margin-left:260px;width:calc(100% - 260px);min-width:0}
+.portal-topbar{min-height:78px;padding:16px 27px;background:rgba(255,255,255,.88);backdrop-filter:blur(18px);border-bottom:1px solid #e5eaf5;box-shadow:0 4px 18px rgba(22,35,62,.035)}
+.portal-page-header h1{font-size:22px;font-weight:800;letter-spacing:-.7px}
+.portal-page-header p{font-size:12px;color:#71819c}
+.portal-topbar-actions{gap:9px}
+.portal-search-box{height:39px;border-radius:12px;background:#f8faff;border-color:#e1e7f2}
+.portal-icon-btn{height:39px;width:39px;border-radius:12px;background:#fff}
+.portal-content{max-width:none;width:100%;padding:25px 27px 38px}
+.portal-kpi-grid{gap:15px;margin-bottom:19px}
+.portal-kpi-card{min-height:130px;border-radius:17px;padding:19px 20px;background:linear-gradient(180deg,#fff,#fcfdff);border:1px solid #e5eaf5;box-shadow:0 3px 13px rgba(20,35,70,.035)}
+.portal-kpi-value{font-size:27px;color:#18243d}
+.portal-card{border:1px solid #e4eaf5;border-radius:18px;background:#fff;box-shadow:0 3px 14px rgba(20,35,70,.035);padding:21px}
+.portal-card-header{border-bottom:1px solid #eef2f8;padding-bottom:15px;margin-bottom:16px}
+.portal-card-title{font-size:15px;font-weight:800}
+.portal-table-container{border-radius:14px;border-color:#e5ebf5}
+.portal-table th{background:#f7f9ff;color:#74839b}
+.portal-table td{color:#3d4e69}
+.portal-btn-primary{background:linear-gradient(100deg,#5630e8,#7955ff)}
+.portal-btn-accent{background:linear-gradient(100deg,#ff7a00,#ff9a36)}
+.portal-filter-tabs{background:#f4f6fc}
+.portal-filter-tab.active{color:#5b35e8}
+.portal-modal-card{border-radius:20px}
+@media(max-width:1100px){body.in-owner-portal .portal-main{margin-left:260px;width:calc(100% - 260px)}.portal-content{padding:22px}}
+@media(max-width:768px){body.in-owner-portal .portal-main{margin-left:0;width:100%}.portal-content{padding:15px 13px 25px}.portal-topbar{padding:13px 15px}}
