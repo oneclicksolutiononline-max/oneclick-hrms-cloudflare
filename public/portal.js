@@ -129,27 +129,11 @@
     var sb = el('aside', 'portal-sidebar');
     sb.id = 'portal_sidebar';
 
-    // Brand section with OneClick Symbol
+    // Official OneClick Solution brand mark
     var brand = el('div', 'portal-sidebar-brand');
-    brand.innerHTML = 
+    brand.innerHTML =
       '<div class="portal-brand-wrap">' +
-        '<svg width="38" height="38" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">' +
-          '<defs>' +
-            '<linearGradient id="ocBlue" x1="0%" y1="0%" x2="100%" y2="100%">' +
-              '<stop offset="0%" stop-color="#1E40AF" />' +
-              '<stop offset="100%" stop-color="#3B82F6" />' +
-            '</linearGradient>' +
-            '<linearGradient id="ocOrange" x1="0%" y1="0%" x2="100%" y2="100%">' +
-              '<stop offset="0%" stop-color="#EA580C" />' +
-              '<stop offset="100%" stop-color="#FF5500" />' +
-            '</linearGradient>' +
-          '</defs>' +
-          '<polygon points="50,5 92,28 92,72 50,95 8,72 8,28" fill="#0F172A" stroke="url(#ocBlue)" stroke-width="4" rx="8" />' +
-          '<path d="M50 14 L84 33 L84 67 L50 86 L16 67 L16 33 Z" stroke="url(#ocOrange)" stroke-width="6" fill="none" stroke-linejoin="round" />' +
-          '<path d="M44 26 L56 26 L56 74 L44 74 Z" fill="#FFFFFF" />' +
-          '<polygon points="36,40 50,26 50,40" fill="#FFFFFF" />' +
-          '<polygon points="70,50 82,42 82,58" fill="url(#ocOrange)" />' +
-        '</svg>' +
+        '<img class="portal-brand-logo" src="oneclick-logo.svg" alt="OneClick Solution logo">' +
         '<div>' +
           '<div class="portal-brand-title">OneClick <span>HRMS</span></div>' +
           '<div class="portal-brand-badge">SaaS Owner Portal</div>' +
