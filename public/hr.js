@@ -1,0 +1,684 @@
+/* HR – the pages (Phase 1, 12-11-2026): Employees (list, one employee, add / change, transfer, exit, import from Excel), Departments,
+ * Designations. The sign-in is index.html's; it calls HR.open(me, page). Every text of a person is put in as TEXT, never as HTML. */
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var el = function (tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined && text !== null) e.textContent = String(text); return e; };
+  var S = { me: null, init: null, page: 'employees', q: '', status: '', category: '', rows: [], open: null, imp: null };
+  var api = function (action, body) { return window.HRAPI('api/hr', Object.assign({ action: action }, body || {})); };
+  // a date as DD-MM-YYYY; a moment (…T…Z) is shown as its day in India
+  var dmy = function (d) { if (!d) return ''; d = String(d); if (d.indexOf('T') > 0) { var t = Date.parse(d); if (!isNaN(t)) d = new Date(t + 19800000).toISOString(); } return d.slice(0, 10).split('-').reverse().join('-'); };
+  // (13-11-2026: "waiting for otp nko yeyla") a person signs in with his e-mail or his mobile number – a record with all it needs is "Complete"
+  var STATUS = { incomplete: 'Incomplete', pending: 'Complete', active: 'Active', left: 'Relieved' };
+  var CAT = { staff: 'Staff', operator: 'Operator', driver: 'Driver', labour: 'Labour' };
+  var isAdmin = function () { return S.me && (S.me.user.role === 'admin' || S.me.user.role === 'super'); };
+  var nameOf = function (list, id) { var r = (list || []).filter(function (x) { return x.id === id; })[0]; return r ? r.name : ''; };
+  function toast(t, bad) { var e = $('toast'); e.textContent = t; e.className = bad ? 'bad' : ''; e.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(function () { e.hidden = true; }, bad ? 8000 : 3500); }
+  function busy(btn, on) { if (btn) { btn.disabled = !!on; } }
+  function fail(e) { toast(e && e.message ? e.message : 'HR did not answer – try again.', true); }
+
+  // ---------- the frame of the pages ----------
+  function face(td, key) { if (window.HRDASH && window.HRDASH.face) td.insertBefore(window.HRDASH.face(td.textContent, key), td.firstChild); return td; }      // the letters of his name before it
+  var PAGE_HEAD = { joining: ['Joining', ''], papers: ['Papers to verify', ''], cpolicies: ['Company policies', ''], notices: ['Notifications', ''], reports: ['Reports', 'Every report of this site with its filters – on the screen, as Excel or as PDF.'], ai: ['AI assistant', 'AI reads and suggests – a person decides. It never approves or changes pay, bank details, faces or attendance.'], employees: ['Employees', 'The Employee Master of this site – press a person to open his page.'], attendance: ['Attendance', 'Every punch of a day as it was taken – and the doubtful ones to be looked at.'], places: ['Work places', 'Where attendance can be marked: the place, how many metres, for whom.'],
+    phones: ['Phones', 'One phone a person – only attendance is tied to it.'], requests: ['Requests', 'People ask to set an old day right – it counts only when approved.'], rules: ['Rule Book', 'Shifts and holidays of this site – each with its date.'], rface: ['Rule Book', 'The face at every attendance and who decides a request – one setting for the whole site, from a date.'], rpowers: ['Rule Book', 'What the HR Admin of this site may do – the Super Admin gives or takes each power.'],
+    departments: ['Departments & designations', 'The two lists offered in an employee\'s form – a designation says its category.'], designations: ['Departments & designations', ''], leave: ['Leave', 'Requests – who each waits for, its history, change and delete – and everybody\'s balance. The leave policy is in the Rule Book.'], payroll: ['Payroll', 'The HO HR makes a month\'s pay from the approved attendance and the approved salaries – then locks it.'], month: ['Month verification', 'After the month ends: the site\'s HR verifies each person\'s days, the HO HR approves the month.'], lists: ['Lists', 'Every pick-list of the profile, and which details are compulsory – yours to change.'] };
+  /* (13-11-2026, the pictures he approved: "all approved aahe … ctrl k thew") THE MENU: the same pages as before, now down the left
+   * side in three groups (in Mechanical's screen and on a narrow screen: the row of buttons as before). A page shows a count
+   * beside its name when the dashboard knows of work waiting there (HRBADGE). The list is also what Ctrl K searches. */
+  /* (13-11-2026, his picture) the menu as in the picture: HR Management · Organization · Payroll, each page with its sign; a page
+   * picked closes the menu (HRNAV). */
+  var GROUP = { joining: 'HR Management', papers: 'HR Management', cpolicies: 'Organization', notices: 'Organization', reports: 'HR Management', ai: 'Organization', employees: 'HR Management', attendance: 'HR Management', leave: 'HR Management', muster: 'HR Management', requests: 'HR Management', departments: 'Organization', lists: 'Organization', places: 'Organization', phones: 'Organization', rules: 'Organization', payroll: 'Payroll', month: 'Payroll', rulebook: 'Organization', approvals: 'HR Management' }, ORDER = ['', 'HR Management', 'Organization', 'Payroll'];
+  var RANK = ['dashboard', 'employees', 'joining', 'papers', 'attendance', 'leave', 'muster', 'requests', 'approvals', 'reports', 'departments', 'lists', 'rulebook', 'cpolicies', 'notices', 'ai', 'places', 'phones', 'rules', 'payroll', 'month'];
+  var ICON = { ai: 'M12 3l1.8 4.6L18.5 9l-4.7 1.6L12 15l-1.8-4.4L5.5 9l4.7-1.4zM18 15l.9 2.1L21 18l-2.1.9L18 21l-.9-2.1L15 18l2.1-.9z', reports: 'M4 20V10M10 20V4M16 20v-7M22 20H2', joining: 'M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6M19 8v6M16 11h6', papers: 'M6 3h9l4 4v14H6zM14 3v5h5M9 15l2 2 4-4', cpolicies: 'M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6zM9 12l2 2 4-4', notices: 'M6 9a6 6 0 1 1 12 0c0 6 2 7 2 7H4s2-1 2-7M10 20a2 2 0 0 0 4 0', dashboard: 'M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10', employees: 'M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20c0-3.6 2.9-6 6.5-6s6.5 2.4 6.5 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18.5 14.5c1.8.8 3 2.7 3 5.5', attendance: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2',
+    leave: 'M4 7h16v13H4zM8 3v4M16 3v4M4 11h16M9 16l2 2 4-4', muster: 'M5 4h14v16H5zM9 9h.01M12 9h.01M15 9h.01M9 13h.01M12 13h.01M15 13h.01M9 17h6', requests: 'M5 4h14v12H9l-4 4zM9 9h6M9 12h4', departments: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
+    lists: 'M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01', places: 'M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21zM12 12a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z', phones: 'M8 3h8v18H8zM11 18h2', rules: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1',
+    payroll: 'M6 3h9l4 4v14H6zM14 3v5h5M9 12h6M9 16h6M9 8h2', rulebook: 'M5 4h11a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3zM5 17a3 3 0 0 1 3-3h11M9 8h6M9 11h4', approvals: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM8 12l3 3 5-6', month: 'M4 6h16v14H4zM8 3v4M16 3v4M8.5 14l2.5 2.5 4.5-5' };
+  function sign(key) { var NS = 'http://www.w3.org/2000/svg', s = document.createElementNS(NS, 'svg'), p = document.createElementNS(NS, 'path'); s.setAttribute('viewBox', '0 0 24 24'); s.setAttribute('aria-hidden', 'true'); p.setAttribute('d', ICON[key] || ICON.lists); s.appendChild(p); return s; }
+  /* (19-11-2026) an HR User's pages, as the Super Admin gave them in the Portal (Users & Access → Pages): a page with No access is not in
+   * his menu (the server refuses its actions anyway; View: only its reading). A part of the Rule Book goes with the Rule Book. */
+  var PAGE_OF = { rules: 'rulebook', rface: 'rulebook', rpowers: 'rulebook', cpolicies: 'rulebook' };
+  function pageOk(k) { var pg = S.init && S.init.pages; return !pg || pg[PAGE_OF[k] || k] !== 'None'; }
+  function pages() {
+    var all = (window.HRDASH ? window.HRDASH.pages.map(function (p) { return [p[0], p[1], true]; }) : []).concat([['employees', 'Employees', true]]).concat((window.HRATT ? window.HRATT.pages : []).concat(window.HRMUS ? window.HRMUS.pages : []).map(function (p) { return [p[0], p[1], true]; }), (window.HRLEAVE ? window.HRLEAVE.pages : []).map(function (p) { return [p[0], p[1], true]; }), (window.HRMONTH ? window.HRMONTH.pages : []).map(function (p) { return [p[0], p[1], true]; }), (window.HRROLL ? window.HRROLL.pages : []).map(function (p) { return [p[0], p[1], !!(S.init && S.init.ho)]; }), (window.HRPROF ? window.HRPROF.pages : []).map(function (p) { return [p[0], p[1], isAdmin()]; }), [['departments', 'Departments & designations', isAdmin()]], (window.HRBOOK ? window.HRBOOK.pages : []).map(function (p) { return [p[0], p[1], true]; }), (window.HR15 ? window.HR15.pages : []).map(function (p) { return [p[0], p[1], true]; }), (window.HRREP ? window.HRREP.pages : []).map(function (p) { return [p[0], p[1], true]; }), (window.HRAI ? window.HRAI.pages : []).map(function (p) { return [p[0], p[1], true]; })).filter(function (p) { return p[2] && pageOk(p[0]); });
+    var rank = function (k) { var r = RANK.indexOf(k); return r < 0 ? 99 : r; };
+    return all.map(function (p, i) { return [p[0], p[1], GROUP[p[0]] || '', i]; }).sort(function (x, y) { return (ORDER.indexOf(x[2]) - ORDER.indexOf(y[2])) || (rank(x[0]) - rank(y[0])) || (x[3] - y[3]); });
+  }
+  function tabs() {
+    var t = $('tabs'), last = '', bd = window.HRBADGE || {}, n = 0; t.textContent = '';
+    pages().forEach(function (p) {
+      if (inBook(p[0]) && p[0] !== 'rulebook') return;      // (18-11-2026) a part of the Rule Book: opened from its row, not the menu
+      var here = S.page === p[0] || (p[0] === 'rulebook' && inBook(S.page));
+      if (p[2] !== last) { last = p[2]; var g = el('span', 'sd-grp', p[2]); g.style.setProperty('--i', n++); t.appendChild(g); }
+      var b = el('button', 'tab' + (here ? ' on' : '')); b.type = 'button'; b.dataset.page = p[0]; b.style.setProperty('--i', n++); b.title = p[1]; b.setAttribute('aria-label', p[1]); b.appendChild(sign(p[0])); b.appendChild(document.createTextNode(p[1])); if (here) b.setAttribute('aria-current', 'page');      // (14-11-2026) its name also when only the icon shows (the rail)
+     
+      b.onclick = function () { go(p[0]); if (window.HRNAV) window.HRNAV.picked(); };
+      if (bd[p[0]] > 0) { var m = el('em', 'sd-n', bd[p[0]]); m.title = bd[p[0]] + ' waiting'; b.appendChild(m); } t.appendChild(b);
+    });
+  }
+  /* (18-11-2026, asked: "ekach thikani sagle rules policy thew" – his answer: "sagle Rule Book madhe", the company policies too) THE
+   * RULE BOOK IS THE ONE PLACE OF EVERY RULE: its parts are a row at the top of each of them (#p_booknav); the menu shows only
+   * "Rule Book". Each part is the page it was – the same actions, checks and powers; an old link (#page=rules …) still opens it. */
+  var BOOK = [['rulebook', 'Policies'], ['rules', 'Shifts & holidays'], ['rface', 'Face & requests'], ['rpowers', 'HR Admin\'s powers'], ['cpolicies', 'Company policies']];
+  function inBook(k) { return BOOK.some(function (b) { return b[0] === k; }); }
+  function bookNav() {
+    var n = $('p_booknav'); if (!n) return; n.textContent = ''; n.hidden = !inBook(S.page); if (n.hidden) return;
+    var have = pages().map(function (p) { return p[0]; });
+    BOOK.forEach(function (b) { if (have.indexOf(b[0]) < 0) return; var x = el('button', S.page === b[0] ? 'on' : '', b[1]); x.type = 'button'; x.dataset.part = b[0]; if (S.page === b[0]) x.setAttribute('aria-current', 'page'); x.onclick = function () { if (S.page !== b[0]) go(b[0]); }; n.appendChild(x); });
+  }
+  // the head of every page: its name, one line about it, and on the right the page's own controls beside the site
+  function head(title, sub, nodes) { $('p_title').textContent = title; $('p_sub').textContent = sub || ''; var t = $('p_tools'); t.textContent = ''; (nodes || []).forEach(function (n) { t.appendChild(n); }); }
+  window.HRHEAD = { set: head };
+  /* ───────── BACK, ONE STEP AT A TIME (14-11-2026) ─────────
+   * windowOpen – a window of HR is open over the page (an employee's page, a form, a sheet of the Rule Book, the day of the muster …):
+   *   every one of them closes on Esc, so "one step back" closes it the same way.
+   * The browser's Back (popstate): a window open → it is closed and the step is put back (the page stays); else the page of
+   *   that step is shown. The "‹ Back" button does the same and is off when there is nothing of HR to go back to. */
+  var BACK = { on: false, pop: false };
+  function windowOpen() { var l = document.querySelectorAll('.dlg'); for (var i = 0; i < l.length; i++) if (!l[i].hidden && l[i].getClientRects().length) return true; return false; }
+  function closeWindow() { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })); }
+  function backPaint() { var b = $('nav_back'); if (b) b.disabled = !(windowOpen() || (history.state && +history.state.hrN > 0)); }
+  function stepBack() { if (windowOpen()) { closeWindow(); backPaint(); return; } if (history.state && +history.state.hrN > 0) history.back(); }
+  if (window.addEventListener) window.addEventListener('popstate', function (ev) {
+    if (!S.init) return; var st = ev.state || {}, page = st.hrPage || (/[#&]page=([a-z0-9_-]+)/i.exec(location.hash) || [])[1] || '';
+    if (windowOpen()) { closeWindow(); try { history.pushState({ hrPage: S.page, hrN: (+st.hrN || 0) + 1 }, '', location.pathname + location.search + '#page=' + S.page); } catch (e) { /* the page still works */ } backPaint(); return; }
+    if (!page || page === S.page) { backPaint(); return; }
+    BACK.pop = true; try { go(page); } finally { BACK.pop = false; } backPaint();
+  });
+  if (document.addEventListener) { document.addEventListener('click', function () { setTimeout(backPaint, 60); }, true); document.addEventListener('keydown', function () { setTimeout(backPaint, 60); }, true); }
+  function go(page) {
+    ['dlg_emp', 'dlg_form'].forEach(function (d) { if ($(d) && !$(d).hidden) hide(d); });      // (13-11-2026) an employee's full page and his form are left when another page is chosen in the menu
+    if (page === 'designations') page = 'departments';      // (13-11-2026) the two lists are one page
+    if ((page === 'departments' || page === 'designations' || page === 'lists') && !isAdmin()) page = 'employees';
+    if (!pageOk(page)) { var mayGo = pages().filter(function (p) { return !(PAGE_OF[p[0]] && p[0] !== 'rulebook'); }); if (mayGo.length) page = mayGo[0][0]; }      // (19-11-2026) a page not given to him: his first page
+    var att = !!window.HRATT && window.HRATT.has(page);      // (step 4) Attendance, Work places, Phones – att.js
+    var mus = !!window.HRMUS && window.HRMUS.has(page);      // (step 5) Muster, Requests, Shifts & rules – mus.js
+    var dash = !!window.HRDASH && window.HRDASH.has(page);      // the attendance dashboard – dash.js
+    var lv = !!window.HRLEAVE && window.HRLEAVE.has(page);      // (step 7) leave – leave.js
+    var mon = !!window.HRMONTH && window.HRMONTH.has(page);      // (step 10) the month's verification – month.js
+    var roll = !!window.HRROLL && window.HRROLL.has(page) && !!(S.init && S.init.ho);      // (step 12) payroll – payroll.js, the HO HR only
+    var book = !!window.HRBOOK && window.HRBOOK.has(page);      // (step 13) the Rule Book – book.js
+    var prof = !!window.HRPROF && window.HRPROF.has(page);      // (step 6) the lists of the profile – prof.js
+    var h15 = !!window.HR15 && window.HR15.has(page);      // (step 15) joining, papers to verify, company policies – emp15.js
+    var rpt = !!window.HRREP && window.HRREP.has(page);      // (Phase 6) the reports – reports.js
+    var aip = !!window.HRAI && window.HRAI.has(page);      // (Phase 7) the AI assistant – ai.js
+    S.page = att || mus || dash || prof || lv || mon || roll || book || h15 || rpt || aip || page === 'departments' || page === 'designations' ? page : 'employees'; tabs(); bookNav();
+    $('p_emp').hidden = S.page !== 'employees'; $('p_att').hidden = !att; $('p_mus').hidden = !mus; $('p_dash').hidden = !dash; $('p_prof').hidden = !prof; $('p_leave').hidden = !lv; $('p_month').hidden = !mon; $('p_roll').hidden = !roll; $('p_book').hidden = !book; $('p_15').hidden = !h15; $('p_rep').hidden = !rpt; $('p_ai').hidden = !aip; $('p_mast').hidden = att || mus || dash || prof || lv || mon || roll || book || h15 || rpt || aip || S.page === 'employees';
+    var hd = PAGE_HEAD[S.page]; if (hd) head(hd[0], hd[1], []);      // the dashboard and the muster fill the head themselves (HRHEAD.set)
+    /* (14-11-2026, asked: "back cha problem aple purn web war aahe … ek back mhnje ek step back … easy asaw back jane") ONE BACK = ONE
+     * STEP: a page chosen is a step of the browser's own history (its Back, Alt+←, the "‹ Back" button here) – the first page and a
+     * page come back to are not a new step. An open window (an employee's page, a form, a list) is closed first – see stepBack. */
+    try { var addr = location.pathname + location.search + '#page=' + S.page, st = history.state || {};
+      if (BACK.pop || !BACK.on || st.hrPage === S.page || window.HRINNER) history.replaceState({ hrPage: S.page, hrN: +st.hrN || 0 }, '', addr); else history.pushState({ hrPage: S.page, hrN: (+st.hrN || 0) + 1 }, '', addr);
+      BACK.on = true; backPaint(); } catch (e) { /* the page still works */ }
+    if (window.HRALL && !window.HRINNER) window.HRALL.page(S.page);      // (14-11-2026) "All sites": every site's page goes to the chosen page
+    if (aip) window.HRAI.open(S.page, S.me, S.init); else if (rpt) window.HRREP.open(S.page, S.me, S.init); else if (h15) window.HR15.open(S.page, S.me, S.init); else if (dash) window.HRDASH.open(S.me, go); else if (book) window.HRBOOK.open(S.page, S.me); else if (prof) window.HRPROF.open(S.page, S.me); else if (lv) window.HRLEAVE.open(S.page, S.me); else if (mon) window.HRMONTH.open(S.page, S.me); else if (roll) window.HRROLL.open(S.page, S.me); else if (att) window.HRATT.open(S.page, S.me, S.init); else if (mus) window.HRMUS.open(S.page, S.me, S.init); else if (S.page === 'employees') list(); else masters();
+  }
+
+  // ---------- Employees: the list ----------
+  /* (12-11-2026, asked: "user swatacha photo pn set karu shakel profile picture") THE FACES: where an employee has a photo (he
+   * sets it in the app, or the office attaches the paper "Photo") it is shown instead of his letters – in the list and on his
+   * page. The links are asked once for the rows shown and kept in the page's memory only, 8 minutes (they work for 10). */
+  function pic(span, url) { if (!url) return; var im = document.createElement('img'); im.alt = ''; im.onload = function () { span.textContent = ''; span.appendChild(im); }; im.src = url; }
+  function faces() {
+    if (!S.photos || Date.now() - S.photosAt > 8 * 60000) { S.photos = {}; S.photosAt = Date.now(); }
+    var paint = function () { Array.prototype.forEach.call(document.querySelectorAll('#emp_rows [data-face]'), function (f) { pic(f, S.photos[f.dataset.face]); }); if (S.open && !$('dlg_emp').hidden) pic($('d_face'), S.photos[S.open.employee.id]); };
+    var ask = S.rows.map(function (r) { return r.id; }).filter(function (i) { return !(i in S.photos); });
+    if (!ask.length) return paint();
+    api('empPhotos', { ids: ask }).then(function (r) { ask.forEach(function (i) { S.photos[i] = r.photos[i] || ''; }); paint(); }, function () { /* the letters stay */ });
+  }
+  /* (13-11-2026, the picture he approved) THE COLUMN "SIGN-IN": who of the rows shown has a sign-in – the PORTAL is asked (its
+   * api/hrlogin, "check": it only reads; the HR Admin of the site and the Super Admin). Kept 2 minutes in the page's memory.
+   * No answer (an HR User, an older Portal, no connection): the column simply stays away. */
+  function signins() {
+    var th = $('th_signin'), cells = function () { return Array.prototype.slice.call(document.querySelectorAll('#emp_rows td[data-sg]')); };
+    var paint = function () { th.hidden = false; cells().forEach(function (td) { var v = S.sgn.by[td.dataset.sg]; td.textContent = ''; td.hidden = false; if (v === 'has') td.appendChild(el('span', 'st s-active', 'Given')); else if (v === 'off') td.appendChild(el('span', 'st s-incomplete', 'Switched off')); else if (v === 'none') td.appendChild(el('span', 'st s-left', 'Not given')); else td.textContent = '–'; }); };
+    th.hidden = true; if (!isAdmin() || !window.HRPORTAL) return; if (!S.sgn || Date.now() - S.sgn.at > 120000) S.sgn = { at: Date.now(), by: {} };
+    var ask = S.rows.filter(function (e) { return e.status !== 'left' && !(e.id in S.sgn.by); }), box = S.sgn;
+    if (!ask.length) { if (Object.keys(box.by).length) paint(); return; }
+    if (Object.keys(box.by).length) paint();
+    window.HRPORTAL('api/hrlogin', { site: S.init.site, check: ask.map(function (e) { return { email: e.email || '', mobile: e.mobile || '', known: e.portal_email || '' }; }) }).then(function (r) {
+      if (!r || !Array.isArray(r.signins) || r.signins.length !== ask.length) return; ask.forEach(function (e, i) { box.by[e.id] = r.signins[i]; }); if (S.sgn === box) paint();
+      /* (19-11-2026, his picture: "user id khali email as banat aahet tya mule user jo email takto tya weli wrong email or pass") the
+       * Portal says who was made with his MOBILE NUMBER and has an e-mail here now ("link"): they are sent once as "people" – the Portal
+       * puts that e-mail on his user to sign in with (nobody's password changes; never another user's e-mail). Quiet: nothing is shown. */
+      var link = (Array.isArray(r.link) ? r.link : []).map(function (i) { return ask[i]; }).filter(Boolean), go = function () {
+        if (!link.length) return; var part = link.splice(0, 25);
+        window.HRPORTAL('api/hrlogin', { site: S.init.site, people: part.map(function (e) { return { email: e.email || '', mobile: e.mobile || '', name: e.name, known: e.portal_email || '' }; }) }).then(go, function () { /* told again at the next look */ });
+      };
+      go();
+    }, function () { /* the column stays away */ });
+  }
+  function list() {
+    api('empList', { q: S.q, status: S.status, category: S.category }).then(function (r) {
+      S.rows = r.rows; var c = r.counts, chips = $('chips'); chips.textContent = '';
+      [['', 'On the rolls', c.incomplete + c.pending + c.active], ['incomplete', 'Incomplete', c.incomplete], ['pending', 'Complete', c.pending], ['active', 'Active', c.active], ['left', 'Relieved', c.left]].forEach(function (k) {
+        var b = el('button', 'chip' + (S.status === k[0] ? ' on' : '') + (k[0] ? ' s-' + k[0] : '')); b.type = 'button'; b.appendChild(el('i', 'kic', { '': '◉', incomplete: '…', pending: '✓', active: '●', left: '↗' }[k[0]])); b.appendChild(el('span', '', k[1])); b.appendChild(el('b', '', k[2])); b.appendChild(el('small', '', { '': 'on this site', incomplete: 'details still missing', pending: 'ready to be activated', active: 'working now', left: 'kept in the record' }[k[0]])); b.onclick = function () { S.status = k[0]; list(); }; chips.appendChild(b);
+      });
+      var tb = $('emp_rows'); tb.textContent = '';
+      r.rows.forEach(function (e) {
+        var tr = el('tr'); tr.tabIndex = 0;
+        var nm = el('td', 'nm pwho'), box = el('div'); box.appendChild(el('b', '', e.name)); box.appendChild(el('small', '', e.code + (e.joined_on ? ' · Joined ' + dmy(e.joined_on) : ''))); nm.appendChild(box); if (window.HRDASH && window.HRDASH.face) { var fa = window.HRDASH.face(e.name, e.id); fa.dataset.face = e.id; nm.insertBefore(fa, box); } tr.appendChild(nm);
+        var ct = el('td'); ct.appendChild(el('span', 'cat c-' + e.category, CAT[e.category] || e.category)); tr.appendChild(ct);
+        [nameOf(S.init.departments, e.department_id), nameOf(S.init.designations, e.designation_id), e.mobile, dmy(e.left_on)].forEach(function (v) { tr.appendChild(el('td', '', v || '–')); });
+        var sg = el('td', 'sg'); sg.dataset.sg = e.id; sg.hidden = true; tr.appendChild(sg);
+        var td = el('td'); td.appendChild(el('span', 'st s-' + e.status, STATUS[e.status])); tr.appendChild(td); var go = el('td', 'go', '→'); go.setAttribute('aria-hidden', 'true'); tr.appendChild(go);
+        tr.onclick = function () { openEmp(e.id); }; tr.onkeydown = function (ev) { if (ev.key === 'Enter') openEmp(e.id); };
+        tb.appendChild(tr);
+      });
+      $('emp_none').hidden = r.rows.length > 0; $('emp_none').textContent = S.q || S.status || S.category ? 'Nobody matches.' : 'No employee yet – add one, or import the Excel list.';
+      $('emp_more').hidden = !r.more; faces(); signins();
+    }, fail);
+  }
+
+  // ---------- one employee ----------
+  function row(dl, k, v) { dl.appendChild(el('dt', '', k)); dl.appendChild(el('dd', '', v || '–')); }
+  function sites() { return S.init.sites.length ? S.init.sites : [{ code: S.me.site, name: S.me.siteName }]; }
+  function siteName(code) { var x = sites().filter(function (y) { return y.code === code; })[0]; return x && x.name && x.name !== code ? x.name + ' (' + code + ')' : code; }
+  // his attendance at a glance: work places, shift, phone, this month, today, what waits (asked apart – the page opens at once)
+  /* (13-11-2026, his Stitch screen 3) THE MONTH AS A STRIP: five counts and one square for each day of this month – the same
+   * codes as the muster (P, HD, A, leave, weekly off, holiday); today has a ring. */
+  function strip(a) {
+    var box = $('d_strip'); box.textContent = ''; if (!a.days || !a.days.length) return; var t = a.total, today = a.today && a.today.day ? a.today.day : '', kind = function (d) { var c = String(d.code || ''); return c === 'P' ? (d.late ? 'l' : 'p') : c === 'HD' ? 'l' : c === 'A' || c === 'MIS' ? 'a' : c === 'WO' || c === 'H' || c === 'HOL' ? 'o' : c ? 'v' : ''; };
+    var top = el('div', 'sp-top'); [['p', t.P, 'Present'], ['l', t.late, 'Late'], ['a', t.A, 'Absent'], ['l', t.HD, 'Half day'], ['o', t.paid, 'Paid days']].forEach(function (x) { var d = el('div', 'k-' + x[0]); d.appendChild(el('b', '', x[1])); d.appendChild(el('span', '', x[2])); top.appendChild(d); }); box.appendChild(top);
+    var g = el('div', 'sp-days'), now = new Date(Date.now() + 19800000).toISOString().slice(0, 10); a.days.forEach(function (d) { var c = el('div', (kind(d) ? 'k-' + kind(d) : '') + (d.day === (today || now) ? ' now' : '')); c.appendChild(el('b', '', +String(d.day).slice(8, 10))); c.appendChild(el('span', '', d.code || '–')); c.title = dmy(d.day) + (d.code ? ' – ' + d.code + (d.late ? ' (late)' : '') : ''); g.appendChild(c); }); box.appendChild(g);
+  }
+  function aroundDraw(id, a) {
+    var dl = $('d_att'), lab = $('d_att_lab'); dl.textContent = ''; dl.hidden = true; lab.hidden = true; $('d_strip').textContent = '';
+    (function () {
+      if (!a || !S.open || S.open.employee.id !== id) return; var t = a.total, d = a.today;
+      strip(a);
+      row(dl, 'Work places', a.places.length ? a.places.map(function (p) { return p.name; }).join(', ') : 'None is set for him – he cannot mark attendance');
+      row(dl, 'Shift', a.shift); row(dl, 'Phone', a.phone ? (a.phone.model || 'Phone') + (a.phone.os ? ' · ' + a.phone.os : '') + ' – since ' + dmy(String(a.phone.since).slice(0, 10)) : 'None tied yet');
+      row(dl, 'Today', d && d.code ? d.code + (d.in ? ' · IN ' + d.in : '') + (d.out ? ' · OUT ' + d.out : '') : 'Nothing yet');
+      if (!a.days || !a.days.length) row(dl, 'This month', 'Present ' + t.P + ' · Half day ' + t.HD + ' · Absent ' + t.A + ' · Late ' + t.late + ' · Days ' + t.paid + (t.MIS ? ' · IN without OUT ' + t.MIS : '')); else if (t.MIS) row(dl, 'IN without OUT', t.MIS);
+      if (a.requests_waiting) row(dl, 'Requests waiting', a.requests_waiting);
+      dl.hidden = false; lab.hidden = false;
+    })();      // (no answer: attendance is not set up yet, or not his to see – the page stays as it is)
+  }
+  /* (12-11-2026, asked: "line la click kel ki lawkar te open pn hot nahiye … hr modual slow ahe") THE PAGE OPENS AT ONCE with what
+   * the list already has of him (the same details – they were read with the list); his history, the person he reports to, his
+   * attendance and his papers come a moment later, each by itself. Until the server has answered nothing of him can be changed
+   * here (the buttons wait) – so a change always starts from the server's own answer, never from the list. */
+  /* (13-11-2026, asked: "employee war click kel ki … data lagech yet nahi to pn fast yeyla hawa") ONE question to the server for
+   * his whole page (empPage: the person, his attendance, his papers, his profile – read together), and what was read of him
+   * in this visit is shown AT ONCE while the fresh answer is on its way (kept in the page's memory only, 5 minutes). */
+  function openEmp(id) {
+    var seq = S.seq = (S.seq || 0) + 1, had = (S.rows || []).filter(function (x) { return x.id === id; })[0], mem = S.pages && S.pages[id] && Date.now() - S.pages[id].at < 300000 ? S.pages[id].r : null;
+    if (mem) { drawEmp(mem.emp, true); show('dlg_emp'); } else if (had) { drawEmp({ employee: had, history: [], boss: null }, false); show('dlg_emp'); }
+    var all = api('empPage', { id: id });
+    all.then(function (r) {
+      (S.pages || (S.pages = {}))[id] = { at: Date.now(), r: r };
+      if (seq !== S.seq || ((had || mem) && $('dlg_emp').hidden)) return;      // he opened another, or closed the page meanwhile
+      drawEmp(r.emp, true); show('dlg_emp'); docsMiss(r.priv); aroundDraw(id, r.around);
+      if (window.HR15) window.HR15.emp(r.emp.employee, function () { return seq === S.seq && !$('dlg_emp').hidden; }, S.me, S.init);      // (step 15) reporting, places, insurance, activation
+    }, function (x) { if (seq === S.seq) { if (had || mem) hide('dlg_emp'); fail(x); } });
+    $('d_docs_miss').hidden = true; if (mem) { docsMiss(mem.priv); aroundDraw(id, mem.around); } else aroundDraw(id, null);
+    if ($('d_15')) $('d_15').textContent = '';
+    if (window.HRBOOK && window.HRBOOK.ledger) window.HRBOOK.ledger(id, $('d_led'), $('d_led_body'), function () { return seq === S.seq; }, isAdmin() || !!(S.init && S.init.ho)); else $('d_led').hidden = true;      // (step 13) his leave: two balances and the ledger
+    profIn(id, seq, '', all.then(function (r) { if (!r.prof) throw new Error('The profile could not be read.'); return r.prof; }), mem && mem.prof);
+  }
+  function docsMiss(p) { if (!p || !S.open) return; var e = S.open.employee, m = p.docsMissing || []; $('d_docs_miss').hidden = !m.length || e.status === 'left'; $('d_docs_miss').textContent = 'Documents still to attach: ' + m.join(', ') + '.'; }
+  /* (13-11-2026, "ekach screen madhe sagle") his FULL PROFILE is in the same page: its tabs beside "Overview" (prof.js draws them
+   * here), how far it is filled in the head, what is still missing in "Still to do". */
+  function profIn(id, seq, tab, first, mem) {
+    var box = $('d_todo_body'), pct = $('d_pct'); box.textContent = ''; box.appendChild(el('p', 'muted', 'Reading…')); pct.hidden = true; $('d_tabs').textContent = ''; $('d_pbody').textContent = ''; $('d_over').hidden = false; $('d_pbody').hidden = true; S.prof = null;
+    if (!window.HRPROF) { box.textContent = ''; $('d_todo').hidden = true; return; }
+    var live = function () { return seq === S.seq; };
+    S.prof = window.HRPROF.profile(id, null, { tabs: $('d_tabs'), body: $('d_pbody'), tab: tab || 'overview', live: live, first: first, mem: mem,
+      show: function (on) { $('d_over').hidden = !on; $('d_pbody').hidden = on; },
+      fail: function () { box.textContent = ''; box.appendChild(el('p', 'muted', 'The profile could not be read – open the person again.')); },
+      data: function (r) {
+        var c = r.complete, m = c.missing || []; pct.textContent = ''; pct.appendChild(window.HRPROF.ring(c.pct)); pct.appendChild(el('small', '', c.filled + ' of ' + c.of + ' details')); pct.hidden = false;
+        box.textContent = ''; var top = el('div', 'td-top'), t = el('div'); t.appendChild(el('b', '', c.pct + '% filled')); t.appendChild(el('small', '', c.filled + ' of ' + c.of + ' details · ' + m.length + ' compulsory missing')); top.appendChild(t); box.appendChild(top);
+        if (m.length) box.appendChild(el('p', 'warn', 'Compulsory, still missing: ' + m.slice(0, 12).join(', ') + (m.length > 12 ? ' … and ' + (m.length - 12) + ' more' : '') + '.')); else box.appendChild(el('p', 'muted', 'Every compulsory detail is filled.'));
+        S.profFirst = (function () { var g = r.defs.groups.filter(function (g) { return g.fields.some(function (f) { return m.indexOf(f.label) > -1; }); })[0], w = r.defs.rows.filter(function (w) { return m.some(function (x) { return x.indexOf(w.name) === 0; }); })[0]; return g ? g.key : w ? w.key : r.defs.groups[0] ? r.defs.groups[0].key : ''; })();
+      } });
+  }
+  function drawEmp(r, full) {
+      var e = r.employee; S.open = r; $('d_title').textContent = e.name; $('d_code').textContent = e.code + ' · ' + (CAT[e.category] || ''); var cp = $('d_chips'); cp.textContent = ''; [e.code, CAT[e.category] || '', nameOf(S.init.designations, e.designation_id), nameOf(S.init.departments, e.department_id)].forEach(function (v) { if (v) cp.appendChild(el('span', '', v)); }); cp.appendChild(el('span', 'site', siteName(e.site))); $('d_crumb').textContent = '› ' + e.name; var sgv = S.sgn && S.sgn.by[e.id], sgt = $('d_sg'); sgt.hidden = !sgv; if (sgv) { sgt.className = 'st ' + (sgv === 'has' ? 's-active' : sgv === 'off' ? 's-incomplete' : 's-left'); sgt.textContent = 'Sign-in: ' + (sgv === 'has' ? 'given' : sgv === 'off' ? 'switched off' : 'not given'); }
+      var fc = $('d_face'), st = $('d_st'); fc.textContent = e.name.trim().split(/\s+/).map(function (w) { return w.charAt(0); }).slice(0, 2).join('').toUpperCase(); st.className = 'st ep-st s-' + e.status; st.textContent = STATUS[e.status]; pic(fc, S.photos && S.photos[e.id]);
+      var dl = $('d_list'), dl2 = $('d_list2'); dl.textContent = ''; dl2.textContent = '';
+      row(dl, 'Site', siteName(e.site)); row(dl, 'Designation', nameOf(S.init.designations, e.designation_id)); row(dl, 'Department', nameOf(S.init.departments, e.department_id));
+      row(dl, 'Reports to', r.boss ? r.boss.name + ' (' + r.boss.code + ')' : !full && e.reports_to ? '…' : ''); row(dl, 'Active from', dmy(e.joined_on)); row(dl, 'Relieving date', e.status === 'left' ? dmy(e.left_on) : ''); if (e.status === 'left') row(dl, 'Reason', e.left_reason);
+      row(dl2, 'Mobile', e.mobile); row(dl2, 'E-mail', e.email + (e.email ? (e.email_verified_at ? ' ✓ verified' : ' – not verified yet') : '')); row(dl2, 'Date of birth', dmy(e.dob)); row(dl2, 'Gender', e.gender ? e.gender.charAt(0).toUpperCase() + e.gender.slice(1) : '');
+      var miss = []; if (!e.dob) miss.push('Date of birth'); if (!e.email) miss.push('E-mail'); if (!e.mobile) miss.push('Mobile');
+      $('d_miss').hidden = !miss.length || e.status === 'left'; $('d_miss').textContent = 'Incomplete – still needed: ' + miss.join(', ') + '. He cannot be activated until then.';
+      var h = $('d_hist'); h.textContent = '';
+      r.history.forEach(function (x) { var li = el('li'); li.appendChild(el('b', '', dmy(x.valid_from) + ' → ' + (x.valid_to ? dmy(x.valid_to) : 'today'))); li.appendChild(el('span', '', ' ' + x.site + ' · ' + (nameOf(S.init.designations, x.designation_id) || '–') + ' · ' + (nameOf(S.init.departments, x.department_id) || '–') + (x.note ? ' · ' + x.note : ''))); h.appendChild(li); });
+      var left = e.status === 'left'; $('d_edit').hidden = left; $('d_tr').hidden = left || !isAdmin(); $('d_exit').hidden = left || !isAdmin(); $('d_del').hidden = !isAdmin();
+      $('d_salary').hidden = !isAdmin();      // (step 11) his salary: the HR Admin's or the Super Admin's to see and propose
+      $('d_login').hidden = left || !isAdmin();      // his sign-in: the HR Admin's or the Super Admin's to give
+      if (!full) h.appendChild(el('li', '', '…'));
+      // nothing of him is opened or changed before the server's own answer is here
+      ['d_prof', 'd_kyc', 'd_docs', 'd_login', 'd_facebtn', 'd_salary', 'd_del', 'd_exit', 'd_tr', 'd_edit'].forEach(function (b) { $(b).disabled = !full; });
+  }
+
+  /* ---------- his sign-in for the app (12-11-2026: "ADMIN … LA EK TEMP PASSWORD DEU SHAKEL NANTR USER SWATACHA PASS SET KRU SHAKEL") ----------
+   * Given by the Portal (its api/hrlogin) to the HR Admin of the site or the Super Admin: a one-time password, and "My HR" only. */
+  function login() {
+    var e = S.open.employee, any = !!(e.email || e.mobile); $('lg_title').textContent = 'Sign-in for ' + e.name + ' (' + e.code + ')'; $('lg_email').textContent = e.email || '– none –'; $('lg_mobile').textContent = e.mobile || '– none –';
+    $('lg_done').hidden = true; $('lg_pw').textContent = ''; $('lg_err').hidden = any; if (!any) $('lg_err').textContent = 'He has no e-mail and no mobile number: put one of them in his record first – he signs in with it.';
+    $('lg_go').hidden = !any; $('lg_go').disabled = false; $('lg_go').textContent = 'Give the password';
+    show('dlg_login');
+  }
+  function loginGive() {
+    var e = S.open.employee, b = $('lg_go'); b.disabled = true; $('lg_err').hidden = true;
+    // (13-11-2026) his e-mail, his mobile number, or both; `known` = the user ID the Portal gave him before (a number changed since)
+    window.HRPORTAL('api/hrlogin', { site: e.site, email: e.email || '', mobile: e.mobile || '', name: e.name, known: e.portal_email || '' }).then(function (r) {
+      S.sgn = null; $('lg_pw').textContent = r.password; $('lg_done').hidden = false; b.disabled = false; b.textContent = 'Give another one';
+      if (r.id && r.id !== e.email && r.id !== e.portal_email) api('signinLinked', { rows: [{ id: e.id, portal: r.id }] }).then(function () { e.portal_email = r.id; }, function () { /* kept at the next time */ });
+    }, function (x) { b.disabled = false; $('lg_err').textContent = x.message; $('lg_err').hidden = false; });
+  }
+  /* ---------- a sign-in for EVERYBODY at once (13-11-2026; the button is the Super Admin's, and an HR Admin's he gave the power) ----------
+   * The Portal makes the users, 20 a call; only new ones – nobody's password is changed; the first password follows its rule. */
+  function signinOpen() {
+    $('sg_err').hidden = true; $('sg_res').hidden = true; $('sg_res').textContent = ''; $('sg_sum').textContent = 'Reading the employees…'; $('sg_go').hidden = true; show('dlg_signin');
+    api('signinPeople').then(function (r) { S.sg = r.people; $('sg_sum').textContent = r.people.length + ' employees of this site have an e-mail or a mobile number' + (r.without ? ' · ' + r.without + ' have neither (no sign-in until one is put in their record)' : '') + '.'; $('sg_go').hidden = !r.people.length; $('sg_go').disabled = false; $('sg_go').textContent = 'Give the sign-ins'; $('sg_go').onclick = signinGo; },
+      function (e) { $('sg_sum').textContent = ''; $('sg_err').textContent = e.message; $('sg_err').hidden = false; });
+  }
+  function signinGo() {
+    S.sgn = null; var people = S.sg || [], b = $('sg_go'), made = 0, has = 0, bad = [], link = [], i = 0, site = S.init.site; b.disabled = true; $('sg_err').hidden = true;
+    var end = function (err) {
+      var box = $('sg_res'); box.textContent = ''; box.appendChild(el('p', 'sum', made + ' sign-ins given · ' + has + ' had one already (not changed) · ' + bad.length + ' not given.'));
+      if (bad.length) { var ul = el('ul', 'faults'); bad.slice(0, 200).forEach(function (x) { var li = el('li'); li.appendChild(el('b', '', x.code + ' – ' + x.name + ': ')); li.appendChild(el('span', '', x.why)); ul.appendChild(li); }); box.appendChild(ul); }
+      box.hidden = false; $('sg_sum').textContent = err ? 'Stopped after ' + i + ' of ' + people.length + '.' : 'Done – ' + people.length + ' employees.'; if (err) { $('sg_err').textContent = err; $('sg_err').hidden = false; b.disabled = false; b.textContent = 'Go on'; b.onclick = function () { b.disabled = true; $('sg_err').hidden = true; step(); }; } else b.hidden = true;      // (go on: from where it stopped)
+    };
+    var step = function () {
+      if (i >= people.length) return end('');
+      var part = people.slice(i, i + 20); $('sg_sum').textContent = 'Giving the sign-ins… ' + i + ' of ' + people.length;
+      window.HRPORTAL('api/hrlogin', { site: site, people: part.map(function (p) { return { email: p.email, mobile: p.mobile, name: p.name, known: p.known }; }) }).then(function (r) {
+        var rows = [];
+        (r.people || []).forEach(function (x, k) { var p = part[k]; if (x.state === 'made') made++; else if (x.state === 'has') has++; else bad.push({ code: p.code, name: p.name, why: x.why || 'not given' }); if (x.id && x.id !== p.email && x.id !== p.known) rows.push({ id: p.id, portal: x.id }); });
+        i += part.length;
+        return rows.length ? api('signinLinked', { rows: rows }).then(step, step) : step();
+      }, function (e) { end(e.message); });
+    };
+    step();
+  }
+
+  /* ---------- (18-11-2026, asked: "pratek employee la sign in access deyla lagtey, employee add zala ki auto jayla hawa … te pass apan
+   * tharwla tas same first pass" – his answers: the first password by the rule of 13-11-2026, Ramesh@1234; in HR only, when an
+   * employee is added or imported – also approved from a joining link) A NEW EMPLOYEE'S SIGN-IN BY ITSELF ----------
+   * The Portal makes his user ("My HR" on his site) exactly as "Sign-in for everybody" does (api/hrlogin, people): ONLY a new user –
+   * nobody's password is changed; his first password is the Portal's rule; he sets his own at the first sign-in. The Portal itself
+   * checks who may (the HR Admin of that site, the Super Admin) – an HR User's new employee waits for "Sign-in" on his page.
+   * list: [{ id, code, name, email, mobile, portal_email?, site? }] → Promise of { made: [people], has: n, bad: [{ name, why }] } – never fails */
+  function firstPw(name) { var w = (String(name || '').trim().split(/\s+/)[0] || '').replace(/[^A-Za-z]/g, ''); return w.length >= 2 ? w[0].toUpperCase() + w.slice(1).toLowerCase() + '@1234' : ''; }
+  function autoSignin(list) {
+    var out = { made: [], has: 0, bad: [] }, people = (list || []).filter(function (e) { return e && e.id; }), i = 0;
+    people = people.filter(function (e) { if (e.email || e.mobile) return true; out.bad.push({ name: e.name, why: 'no e-mail and no mobile number in his record' }); return false; });
+    if (!people.length || !window.HRPORTAL || !S.init || !isAdmin()) { if (people.length && !isAdmin()) people.forEach(function (e) { out.bad.push({ name: e.name, why: 'the HR Admin or the Super Admin gives it (his page → Sign-in)' }); }); return Promise.resolve(out); }
+    var step = function () {
+      if (i >= people.length) return Promise.resolve(out);
+      var site = people[i].site || S.init.site, part = people.slice(i).filter(function (p) { return (p.site || S.init.site) === site; }).slice(0, 20);
+      return window.HRPORTAL('api/hrlogin', { site: site, people: part.map(function (p) { return { email: p.email || '', mobile: p.mobile || '', name: p.name, known: p.portal_email || '' }; }) }).then(function (r) {
+        var rows = []; (r.people || []).forEach(function (x, k) { var p = part[k]; if (x.state === 'made') out.made.push(p); else if (x.state === 'has') out.has++; else out.bad.push({ name: p.name, why: x.why || 'not given' }); if (x.id && x.id !== p.email && x.id !== p.portal_email) rows.push({ id: p.id, portal: x.id }); });
+        people = people.filter(function (p) { return part.indexOf(p) < 0; }); S.sgn = null;
+        return (rows.length ? api('signinLinked', { rows: rows }).then(null, function () { /* kept at the next time */ }) : Promise.resolve()).then(step);
+      });
+    };
+    return step().then(null, function (e) { people.forEach(function (p) { if (out.made.indexOf(p) < 0) out.bad.push({ name: p.name, why: e.message }); }); return out; });
+  }
+  // what to say: one person – how he signs in and his first password; many – how many
+  function signinSaid(r) {
+    if (r.made.length === 1 && !r.bad.length) { var p = r.made[0], pw = firstPw(p.name); return 'Sign-in given to ' + p.name + ': ' + (p.email || p.mobile) + (pw ? ' · first password ' + pw : ' · his first password could not be made from his name – give one from his page (Sign-in)') + ' – he sets his own at the first sign-in.'; }
+    var t = []; if (r.made.length) t.push(r.made.length + ' sign-ins given (first password: first name @1234, e.g. Ramesh@1234)'); if (r.has) t.push(r.has + ' had one already'); if (r.bad.length) t.push('not given: ' + r.bad.slice(0, 3).map(function (x) { return x.name + ' – ' + x.why; }).join('; ') + (r.bad.length > 3 ? ' …' : ''));
+    return t.join(' · ');
+  }
+  /* (19-11-2026, asked: "email change zala tri login krta yaw mg email change portal madhun aso ki hr madhun aso") AN E-MAIL CHANGED HERE:
+   * the Portal is told at once (api/hrlogin, "moved") – his sign-in follows: he signs in with the new e-mail (his password, or a code to
+   * it). Only the HR Admin / Super Admin's page tells it (the Portal checks it too); someone with no sign-in yet: nothing to do. Quiet –
+   * a refusal (another user's e-mail, a person with other work in the ERP) is said. list: [{ was, email, mobile, known, name? }] */
+  function signinMoved(list) {
+    var people = (list || []).filter(function (p) { return p && p.email; }); if (!people.length || !window.HRPORTAL || !S.init || !isAdmin()) return;
+    var step = function () {
+      if (!people.length) return; var part = people.splice(0, 50);
+      window.HRPORTAL('api/hrlogin', { site: S.init.site, moved: part.map(function (p) { return { was: p.was || '', email: p.email, mobile: p.mobile || '', known: p.known || '' }; }) }).then(function (r) {
+        var no = (r.moved || []).map(function (x, k) { return x.state === 'refused' ? (part[k].name ? part[k].name + ': ' : '') + x.why : ''; }).filter(Boolean);
+        if (no.length) toast('Sign-in e-mail not changed – ' + no.slice(0, 2).join(' · '), true); S.sgn = null; step();
+      }, function () { /* told again when his e-mail is saved next */ });
+    };
+    step();
+  }
+  function autoSigninSay(list) { return autoSignin(list).then(function (r) { var t = signinSaid(r); if (t) toast(t, r.bad.length > 0 && !r.made.length); return r; }); }
+
+  // ---------- add / change ----------
+  function fill(sel, list, val, none) { sel.textContent = ''; var o = el('option', '', none); o.value = ''; sel.appendChild(o); list.forEach(function (x) { if (!x.active && x.id !== val) return; var p = el('option', '', x.name); p.value = x.id; sel.appendChild(p); }); sel.value = val || ''; }
+  function form(e, boss) {
+    e = e || {}; $('f_title').textContent = e.id ? 'Change ' + e.code : 'Add employee'; $('f_id').value = e.id || ''; $('f_code').value = e.code || '';
+    $('f_name').value = e.name || ''; $('f_cat').value = e.category || ''; $('f_gender').value = e.gender || ''; $('f_mobile').value = e.mobile || ''; $('f_email').value = e.email || '';
+    $('f_dob').value = e.dob || ''; $('f_join').value = e.joined_on || ''; $('f_left').value = e.left_on ? dmy(e.left_on) : '';
+    // (18-11-2026, Phase 2) the birth date / joining date of an employee of today changed: the reason is asked (kept with the change)
+    $('f_dob').dataset.was = e.id ? e.dob || '' : ''; $('f_join').dataset.was = e.id ? e.joined_on || '' : ''; $('f_why').value = ''; whyBox();
+    fill($('f_dep'), S.init.departments, e.department_id, '– none –'); fill($('f_des'), S.init.designations, e.designation_id, '– none –');
+    // his site: one of the sites where this person has HR; for an employee of today another site = a transfer from today (HR Admin)
+    var fs = $('f_site'); fs.textContent = ''; sites().forEach(function (x) { var o = el('option', '', (x.name || x.code) + (x.name && x.name !== x.code ? ' (' + x.code + ')' : '')); o.value = x.code; fs.appendChild(o); }); fs.value = e.site || S.me.site; fs.disabled = !!e.id && !isAdmin();
+    $('f_boss').value = boss ? boss.name + ' (' + boss.code + ')' : ''; $('f_boss').dataset.id = boss ? boss.id : ''; $('f_err').hidden = true;
+    // (18-11-2026, asked: "employee add krtana document upload sagle kahi") ADDING: 8 steps in this one form – the 3 of before, then
+    // (after Save) bank, reporting, work place, documents, insurance + activation (addemp.js). Changing: the 3 steps as before.
+    if (window.HRADD) window.HRADD.reset(); var adding = !e.id && !!window.HRADD;
+    Array.prototype.forEach.call(document.querySelectorAll('#f_form .add-only'), function (x) { x.hidden = !adding; });
+    ['f_father', 'f_city', 'f_state', 'f_pin', 'f_emn', 'f_emr', 'f_emm'].forEach(function (k) { $(k).value = ''; }); $('f_etype').value = '';
+    if (adding && !S.etypes) api('listAll').then(function (r) { S.etypes = ((r.lists || {}).employment_type || []).filter(function (x) { return x.active; }); fill($('f_etype'), S.etypes, '', '– choose –'); }, function () {}); else if (adding) fill($('f_etype'), S.etypes, '', '– choose –');
+    $('f_nsteps').textContent = adding ? '8 steps' : '3 steps'; $('f_note').textContent = adding ? 'After Save the same form goes on: bank & PF, reporting, work place, documents, insurance – each can be skipped and filled later on his page.' : 'Bank, PF / ESIC, family and documents are filled on his own page, after this is saved.';
+    hide('dlg_emp'); show('dlg_form'); step(1); $('f_name').focus();
+  }
+  var LATER = [['Bank & PF', 'bank, IFSC, PF, UAN, ESIC'], ['Reporting', 'reporting manager'], ['Work place', 'where he marks attendance'], ['Documents', 'Aadhaar, PAN, photo, licence …'], ['Insurance', 'mediclaim, then Activate']];
+  /* (13-11-2026, his Stitch screen 4) THE FORM IN STEPS: its three parts (Who, Work, Contact) one at a time, their list on the left
+   * with a tick on a part that is filled. Nothing is saved between the steps – "Save" sends the whole form, as before. */
+  var STEPS = [['Who', 'name, category, date of birth', ['f_name', 'f_cat', 'f_dob']], ['Work', 'site, department, designation', ['f_site', 'f_dep', 'f_des', 'f_join']], ['Contact', 'mobile and e-mail', ['f_mobile', 'f_email']]];
+  function step(n) {
+    n = Math.max(1, Math.min(STEPS.length, n)); S.step = n; var done = 0, box = $('f_steps'); box.textContent = '';
+    Array.prototype.forEach.call(document.querySelectorAll('#f_form .fm-sec'), function (x) { x.hidden = +x.dataset.step !== n; });
+    STEPS.forEach(function (x, i) { var full = x[2].every(function (id) { return !!$(id).value; }); if (full) done++; var b = el('button', 'fm-st' + (i + 1 === n ? ' on' : '') + (full ? ' ok' : '')); b.type = 'button'; b.appendChild(el('i', '', full && i + 1 !== n ? '✓' : i + 1)); var t = el('span'); t.appendChild(el('b', '', (i + 1) + '. ' + x[0])); t.appendChild(el('small', '', x[1])); b.appendChild(t); b.onclick = function () { step(i + 1); }; if (i + 1 === n) b.setAttribute('aria-current', 'step'); box.appendChild(b); });
+    var adding = !$('f_id').value && !!window.HRADD, of = adding ? STEPS.length + LATER.length : STEPS.length;
+    if (adding) LATER.forEach(function (x, i) { var b = el('button', 'fm-st later'); b.type = 'button'; b.appendChild(el('i', '', STEPS.length + i + 1)); var t = el('span'); t.appendChild(el('b', '', (STEPS.length + i + 1) + '. ' + x[0])); t.appendChild(el('small', '', x[1] + ' – after Save')); b.appendChild(t); b.style.opacity = '.55'; b.onclick = function () { $('f_err').textContent = 'Press "Save & continue" first – then this step opens.'; $('f_err').hidden = false; }; box.appendChild(b); });
+    $('f_pct').textContent = Math.round(done * 100 / of) + '% done'; $('f_stepno').textContent = 'Step ' + n + ' of ' + of; $('f_stepname').textContent = n + '. ' + STEPS[n - 1][0];
+    var last = n === STEPS.length; $('f_next').hidden = last; $('f_next').textContent = last ? '' : 'Continue to ' + STEPS[n][0] + ' →'; $('f_next').onclick = function () { step(S.step + 1); var f = document.querySelector('#f_form .fm-sec:not([hidden]) input:not([disabled]), #f_form .fm-sec:not([hidden]) select'); if (f) f.focus(); }; $('f_save').className = last ? 'pri' : 'sec'; $('f_save').textContent = adding ? 'Save & continue' : 'Save';
+  }
+  function whyBox() { var ch = ['f_dob', 'f_join'].some(function (k) { var w = $(k).dataset.was || ''; return !!w && $(k).value !== w; }); $('f_why_box').hidden = !ch; }
+  function pickBoss() {
+    var inp = $('f_boss'), box = $('f_boss_list'); inp.dataset.id = '';
+    api('empPick', { q: inp.value }).then(function (r) {
+      box.textContent = ''; r.rows.filter(function (x) { return x.id !== $('f_id').value; }).forEach(function (x) { var b = el('button', '', x.name + ' (' + x.code + ')'); b.type = 'button'; b.onclick = function () { inp.value = x.name + ' (' + x.code + ')'; inp.dataset.id = x.id; box.hidden = true; }; box.appendChild(b); });
+      box.hidden = !box.childNodes.length;
+    }, function () { box.hidden = true; });
+  }
+  function save(ev) {
+    ev.preventDefault(); var b = $('f_save'); if ($('f_boss').value && !$('f_boss').dataset.id) { $('f_err').textContent = 'Reporting person: choose a name from the list, or leave it empty.'; $('f_err').hidden = false; return; }
+    busy(b, true); var bt0 = b.textContent; b.textContent = 'Saving…';      // (13-11-2026) seen at once
+    api('empSave', { id: $('f_id').value, code: $('f_code').value, name: $('f_name').value, category: $('f_cat').value, gender: $('f_gender').value, mobile: $('f_mobile').value, email: $('f_email').value, dob: $('f_dob').value, joined_on: $('f_join').value, site: $('f_site').value, change_reason: $('f_why').value,
+      department_id: $('f_dep').value, designation_id: $('f_des').value, reports_to: $('f_boss').dataset.id }).then(function (r) {
+      busy(b, false); b.textContent = bt0; S.pages = {};
+      if (r.moved) signinMoved([Object.assign({ name: $('f_name').value }, r.moved)]);      // (19-11-2026) his e-mail changed: his sign-in follows
+      if (!$('f_id').value && r.id) autoSigninSay([{ id: r.id, code: r.code, name: $('f_name').value, email: $('f_email').value, mobile: $('f_mobile').value, site: r.site || S.init.site }]);      // (18-11-2026) a new employee: his sign-in by itself
+      if (!$('f_id').value && window.HRADD && r.id && (!r.site || r.site === S.me.site)) {      // (18-11-2026) adding: the same form goes on with steps 4–8
+        return window.HRADD.go({ id: r.id, code: r.code, name: $('f_name').value, category: $('f_cat').value, email: $('f_email').value, site: r.site || S.me.site, status: r.status },
+          { profile: { father_name: $('f_father').value, city: $('f_city').value, state: $('f_state').value, pin: $('f_pin').value, emergency_name: $('f_emn').value, emergency_relation: $('f_emr').value, emergency_mobile: $('f_emm').value }, job: { employment_type: $('f_etype').value } },
+          S.me, S.init, function () { hide('dlg_form'); list(); });
+      }
+      hide('dlg_form'); if (window.HRPROF && window.HRPROF.saved) window.HRPROF.saved('Saved', r.code + ($('f_name').value ? ' · ' + $('f_name').value : '')); toast(r.code + ' saved' + (r.site && r.site !== S.me.site ? ' at ' + siteName(r.site) + ' – choose that site (top right) to see him' : '') + (r.missing.length ? ' – incomplete: ' + r.missing.join(', ') + ' still needed.' : '.')); list(); if ($('f_id').value && !(r.site && r.site !== S.me.site)) openEmp($('f_id').value);      // a change saved: back on his page
+    }, function (e) { busy(b, false); b.textContent = bt0; $('f_err').textContent = e.message; $('f_err').hidden = false; var m = String(e.message || ''), at = /^(Name|Category|Employee code|Code|Gender|Date of birth)/i.test(m) ? 1 : /^(Mobile|E-mail)/i.test(m) ? 3 : /^(Site|Department|Designation|Report|Active|Joining|Reason)/i.test(m) ? 2 : 0; if (at) step(at); });
+  }
+
+  // ---------- transfer, exit ----------
+  function transfer() {
+    var e = S.open.employee, sel = $('t_site'); sel.textContent = '';
+    (S.init.sites.length ? S.init.sites : [{ code: S.me.site, name: S.me.siteName }]).forEach(function (x) { var o = el('option', '', x.name + ' (' + x.code + ')'); o.value = x.code; sel.appendChild(o); }); sel.value = e.site;
+    fill($('t_dep'), S.init.departments, e.department_id, '– none –'); fill($('t_des'), S.init.designations, e.designation_id, '– none –'); $('t_from').value = ''; $('t_note').value = ''; $('t_err').hidden = true;
+    $('t_title').textContent = 'Transfer ' + e.name + ' (' + e.code + ')'; hide('dlg_emp'); show('dlg_tr');
+  }
+  function transferSave(ev) {
+    ev.preventDefault(); var e = S.open.employee, b = $('t_save'); busy(b, true);
+    api('empTransfer', { id: e.id, site: $('t_site').value, department_id: $('t_dep').value, designation_id: $('t_des').value, reports_to: $('t_site').value === e.site ? e.reports_to : '', from: $('t_from').value, note: $('t_note').value })
+      .then(function () { busy(b, false); hide('dlg_tr'); toast(e.code + ' transferred.'); list(); }, function (x) { busy(b, false); $('t_err').textContent = x.message; $('t_err').hidden = false; });
+  }
+  function exit() { var e = S.open.employee; $('x_title').textContent = 'Relieve ' + e.name + ' (' + e.code + ')'; $('x_on').value = ''; $('x_reason').value = ''; $('x_err').hidden = true; hide('dlg_emp'); show('dlg_exit'); }
+  function exitSave(ev) {
+    ev.preventDefault(); var e = S.open.employee, b = $('x_save'); busy(b, true);
+    api('empExit', { id: e.id, on: $('x_on').value, reason: $('x_reason').value }).then(function () { busy(b, false); hide('dlg_exit'); toast(e.code + ' relieved. Nothing was deleted.'); list(); }, function (x) { busy(b, false); $('x_err').textContent = x.message; $('x_err').hidden = false; });
+  }
+
+  // (asked 12-11-2026) delete: only an employee added by mistake – the server refuses when anything hangs on him
+  function del() { var e = S.open.employee; $('del_title').textContent = 'Delete ' + e.name + ' (' + e.code + ')'; $('del_reason').value = ''; $('del_err').hidden = true; hide('dlg_emp'); show('dlg_del'); $('del_reason').focus(); }
+  function delSave(ev) {
+    ev.preventDefault(); var e = S.open.employee, b = $('del_save'); busy(b, true);
+    api('empDelete', { id: e.id, reason: $('del_reason').value }).then(function () { busy(b, false); hide('dlg_del'); toast(e.code + ' deleted.'); list(); }, function (x) { busy(b, false); $('del_err').textContent = x.message; $('del_err').hidden = false; });
+  }
+  // (13-11-2026) the list as an Excel file in THE EMPLOYEE SHEET's format – the same columns the import reads (the company's own
+  // sheet first, then mobile, e-mail, Aadhaar, bank …). template: the same file without rows.
+  function sheetFile(r, name, done) {
+    var rows = [r.heads].concat(r.rows);
+    var save = function (blob, ext) { var a = el('a'); a.href = URL.createObjectURL(blob); a.download = name + ext; document.body.appendChild(a); a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500); done(); };
+    xlsxLib().then(function (ok) {
+      if (ok) { try { var ws = window.XLSX.utils.aoa_to_sheet(rows), wb = window.XLSX.utils.book_new(); ws['!cols'] = r.heads.map(function (h) { return { wch: Math.max(12, Math.min(30, h.length + 4)) }; }); window.XLSX.utils.book_append_sheet(wb, ws, 'Employees'); return save(new Blob([window.XLSX.write(wb, { bookType: 'xlsx', type: 'array' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), '.xlsx'); } catch (e) { /* the plain file below */ } }
+      var q = function (v) { v = String(v === undefined || v === null ? '' : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+      save(new Blob(['﻿' + rows.map(function (x) { return x.map(q).join(','); }).join('\r\n')], { type: 'text/csv' }), '.csv');      // Excel opens it too
+    });
+  }
+  function exportList() {
+    var b = $('b_exp'); busy(b, true);
+    api('sheetExport', { q: S.q, status: S.status, category: S.category }).then(function (r) {
+      sheetFile(r, 'Employees_' + r.site + '_' + new Date(Date.now() + 19800000).toISOString().slice(0, 10), function () { busy(b, false); toast(r.rows.length + ' employees in the file.' + (r.full ? '' : ' Pay and the secret numbers are written only for the HR Admin.') + ' Change it and Import it back – only what changed is saved.'); });
+    }, function (e) { busy(b, false); fail(e); });
+  }
+  /* (18-11-2026, asked: "excel khup mothi aahe … basic ekasath ghe nantr kyc ek sath … step by step … drop down … kay bhraych te")
+   * THE IMPORT IN STEPS: five small files (empsheet.js) – each downloaded here, filled, and chosen below like any file */
+  function importSteps() {
+    var box = $('i_steps'); if (!box) return; box.textContent = ''; if (!window.HRSHEET) { box.hidden = true; return; }
+    window.HRSHEET.PARTS.filter(function (p) { return !p.admin || isAdmin(); }).forEach(function (p) {
+      var r = el('div', 'imp-step'), t = el('div'); t.appendChild(el('b', '', 'Step ' + p.no + ' – ' + p.name)); t.appendChild(el('small', '', p.what + (p.no > 1 ? ' · the file comes with your employees – fill only the rest' : ' · one row a new person'))); r.appendChild(t);
+      var b = el('button', p.no === 1 ? 'pri sm' : 'sec sm', 'Download Step ' + p.no); b.type = 'button';
+      b.onclick = function () { busy(b, true); window.HRSHEET.make(p.key, S.init).then(function (x) { busy(b, false); toast('Step ' + p.no + ' is in the file' + (p.no > 1 ? ' with ' + x.people + ' employees' : '') + ' – fill it and choose it below.'); }, function (e) { busy(b, false); fail(e); }); };
+      r.appendChild(b); box.appendChild(r);
+    });
+    box.hidden = false;
+  }
+  function formatFile() { var b = $('i_fmt'); busy(b, true); api('sheetExport', { template: 1 }).then(function (r) { sheetFile(r, 'Employee_sheet_format', function () { busy(b, false); toast('The format is in the file – fill it and choose it here.'); }); }, function (e) { busy(b, false); fail(e); }); }
+
+  // ---------- his own details (Aadhaar, PAN, numbers, addresses) ----------
+  function kyc() {
+    var e = S.open.employee; api('privGet', { id: e.id }).then(function (r) {
+      var p = r.personal; $('k_title').textContent = e.name + ' (' + e.code + ') – personal details'; $('k_aadhaar').value = p.aadhaar || p.aadhaar_mask || ''; $('k_pan').value = p.pan || p.pan_mask || '';      /* (Phase 1) an HR User sees the PAN masked – left as it is, it is kept */ $('k_mobile2').value = p.mobile2; $('k_fmobile').value = p.family_mobile; $('k_fname').value = p.family_name;
+      var sel = $('k_frel'); sel.textContent = ''; var o = el('option', '', '–'); o.value = ''; sel.appendChild(o); r.relations.forEach(function (x) { var q = el('option', '', x.charAt(0).toUpperCase() + x.slice(1)); q.value = x; sel.appendChild(q); }); sel.value = p.family_relation;
+      $('k_addr').value = p.address_current; $('k_addr2').value = p.address_permanent; $('k_same').checked = false; $('k_err').hidden = true;
+      var left = e.status === 'left'; $('k_save').hidden = left; show('dlg_kyc');
+    }, fail);
+  }
+  function kycSave(ev) {
+    ev.preventDefault(); var e = S.open.employee, b = $('k_save'); busy(b, true);
+    api('privSave', { id: e.id, aadhaar: $('k_aadhaar').value, pan: $('k_pan').value, mobile2: $('k_mobile2').value, family_mobile: $('k_fmobile').value, family_name: $('k_fname').value, family_relation: $('k_frel').value, address_current: $('k_addr').value, address_permanent: $('k_same').checked ? $('k_addr').value : $('k_addr2').value })
+      .then(function () { busy(b, false); hide('dlg_kyc'); toast('Details of ' + e.code + ' saved.'); }, function (x) { busy(b, false); $('k_err').textContent = x.message; $('k_err').hidden = false; });
+  }
+
+  // ---------- his papers ----------
+  function docs() {
+    var e = S.open.employee; api('docList', { id: e.id }).then(function (r) {
+      S.docs = r; S.docRepl = null; $('o_repl').hidden = true; $('o_title').textContent = e.name + ' (' + e.code + ') – documents'; $('o_err').hidden = true; $('o_number').value = ''; $('o_exp').value = ''; $('o_iss').value = ''; $('o_file').value = '';
+      $('o_iss_box').hidden = !r.verify;      // (step 15) the day it was issued
+      $('o_miss').hidden = !r.docsMissing.length || e.status === 'left'; $('o_miss').textContent = 'Still to attach: ' + r.docsMissing.join(', ') + '.';
+      var sel = $('o_kind'), keep = sel.value; sel.textContent = ''; r.kinds.forEach(function (k) { var o = el('option', '', k.name); o.value = k.key; sel.appendChild(o); }); if (keep) sel.value = keep; sel.onchange = function () { var k = r.kinds.filter(function (x) { return x.key === sel.value; })[0]; $('o_exp_box').hidden = !(k && k.expires); }; sel.onchange();
+      var ul = $('o_rows'); ul.textContent = '';
+      r.docs.forEach(function (d) {
+        var k = r.kinds.filter(function (x) { return x.key === d.kind; })[0], li = el('li', d.active ? '' : 'off');
+        li.appendChild(el('b', '', (k ? k.name : d.kind) + (d.number ? ' · ' + d.number : '') + (d.expires_on ? ' · valid up to ' + dmy(d.expires_on) : '')));
+        li.appendChild(el('span', '', ' · ' + dmy(d.created_at) + ' · ' + d.created_by + (d.issued_on ? ' · issued ' + dmy(d.issued_on) : '') + (d.active ? '' : ' · removed by ' + d.removed_by + ': ' + d.removed_reason)));
+        // (step 15) its state: submitted / under verification / verified / rejected (with why); a newer one in its place
+        if (d.status && d.active) { var stt = el('span', 'st ' + (d.status === 'verified' ? 's-active' : d.status === 'rejected' ? 's-pending' : 's-incomplete'), DOC_ST[d.status] || d.status); stt.style.marginLeft = '6px'; li.appendChild(stt);
+          if (d.verified_by) li.appendChild(el('span', 'muted', ' ' + d.verified_by + ' · ' + dmy(d.verified_at) + (d.verify_note ? ': ' + d.verify_note : '')));
+          if (e.status !== 'left') { var rp = el('button', 'sm ghost', 'Attach a newer one'); rp.type = 'button'; rp.onclick = function () { S.docRepl = d; $('o_kind').value = d.kind; $('o_kind').onchange(); $('o_repl').textContent = 'The new file replaces “' + (k ? k.name : d.kind) + '” of ' + dmy(d.created_at) + ' (the old one stays in the record).'; $('o_repl').hidden = false; $('o_file').focus(); }; li.appendChild(rp); } }
+        if (d.active && isAdmin()) { var rm = el('button', 'sm ghost', 'Remove'); rm.type = 'button'; rm.onclick = function () { docRemove(d); }; li.appendChild(rm); }
+        if (d.canOpen) { var op = el('button', 'sm', 'Open'); op.type = 'button'; op.onclick = function () { busy(op, true); api('docLink', { doc: d.id }).then(function (x) { busy(op, false); window.open(x.url, '_blank', 'noopener'); }, function (x) { busy(op, false); fail(x); }); }; li.appendChild(op); }
+        else if (d.active) li.appendChild(el('span', 'muted', ' · opened only by the HR Admin'));
+        ul.appendChild(li);
+      });
+      $('o_none').hidden = r.docs.length > 0; $('o_add').parentNode.hidden = e.status === 'left';
+      // (step 15) the kinds that do not apply to him – with why; marked / taken back by the HR Admin
+      $('o_na_box').hidden = !r.verify; var na = $('o_na'); na.textContent = ''; $('o_evs').hidden = true;
+      (r.na || []).forEach(function (n) { var k = r.kinds.filter(function (x) { return x.key === n.kind; })[0], li = el('li'); li.appendChild(el('b', '', k ? k.name : n.kind)); li.appendChild(el('span', '', ' · ' + n.reason + ' · ' + n.by + ' · ' + dmy(n.at)));
+        if (isAdmin() && e.status !== 'left') { var bk = el('button', 'sm ghost', 'Applicable again'); bk.type = 'button'; bk.onclick = function () { api('docNa', { id: e.id, kind: n.kind, na: false }).then(function () { toast('Applicable again.'); docs(); }, fail); }; li.appendChild(bk); } na.appendChild(li); });
+      if (!(r.na || []).length) na.appendChild(el('li', 'muted', 'None.'));
+      var nk = $('o_na_kind'), haveK = r.docs.filter(function (d) { return d.active && d.status !== 'rejected'; }).map(function (d) { return d.kind; }), naK = (r.na || []).map(function (n) { return n.kind; }); nk.textContent = ''; $('o_na_why').value = '';
+      r.kinds.filter(function (k) { return haveK.indexOf(k.key) < 0 && naK.indexOf(k.key) < 0; }).forEach(function (k) { var o = el('option', '', k.name); o.value = k.key; nk.appendChild(o); });
+      $('o_na_form').hidden = $('o_na_add').hidden = !isAdmin() || e.status === 'left' || !nk.options.length;
+      show('dlg_docs');
+    }, fail);
+  }
+  function docAdd() {
+    var e = S.open.employee, f = $('o_file').files[0], b = $('o_add'), bad = function (t) { busy(b, false); $('o_err').textContent = t; $('o_err').hidden = false; };
+    $('o_err').hidden = true; if (!f) return bad('Choose the file first.');
+    busy(b, true);
+    api('docUploadUrl', { id: e.id, kind: $('o_kind').value, type: f.type, bytes: f.size }).then(function (u) {
+      return fetch(u.url, { method: 'PUT', headers: { 'Content-Type': f.type, 'x-upsert': 'false' }, body: f }).then(function (r) { if (!r.ok) throw new Error('"' + f.name + '" was not kept (' + r.status + ') – try again.'); return api('docAdd', { id: e.id, kind: $('o_kind').value, path: u.path, bytes: f.size, number: $('o_number').value, expires_on: $('o_exp_box').hidden ? '' : $('o_exp').value, issued_on: $('o_iss_box').hidden ? '' : $('o_iss').value, replaces: S.docRepl && S.docRepl.kind === $('o_kind').value ? S.docRepl.id : '' }); }, function () { throw new Error('"' + f.name + '" could not be sent – check the internet and try again.'); });
+    }).then(function () { busy(b, false); toast('Attached.'); docs(); }, function (x) { bad(x.message); });
+  }
+  var DOC_ST = { submitted: 'Submitted', under_verification: 'Under verification', verified: 'Verified', rejected: 'Rejected' };
+  // (step 15) a kind of paper that does not apply to him – with why
+  function docNaAsk() {
+    var e = S.open.employee, b = $('o_na_add'); busy(b, true);
+    api('docNa', { id: e.id, kind: $('o_na_kind').value, reason: $('o_na_why').value }).then(function () { busy(b, false); toast('Marked not applicable.'); docs(); }, function (x) { busy(b, false); fail(x); });
+  }
+  function docEvents() {
+    var e = S.open.employee, ul = $('o_evs'); if (!ul.hidden) { ul.hidden = true; return; } ul.textContent = ''; ul.appendChild(el('li', 'muted', 'Reading…')); ul.hidden = false;
+    var W = { uploaded: 'attached', verified: 'verified', rejected: 'rejected', reupload_asked: 'asked again', replaced: 'replaced by a newer one', not_applicable: 'marked not applicable', applicable: 'applicable again' };
+    api('docEvents', { id: e.id }).then(function (r) { ul.textContent = ''; r.rows.forEach(function (x) { ul.appendChild(el('li', '', dmy(x.at) + ' · ' + x.kind_name + ' – ' + (W[x.event] || x.event) + (x.note ? ': ' + x.note : '') + ' · ' + x.by)); }); if (!r.rows.length) ul.appendChild(el('li', 'muted', 'Nothing yet.')); }, function (x) { ul.hidden = true; fail(x); });
+  }
+  function docRemove(d) { var why = window.prompt('Why is this document removed? (It stays in the record.)'); if (why === null) return; api('docRemove', { doc: d.id, reason: why }).then(function () { toast('Removed – kept in the record.'); docs(); }, fail); }
+
+  // ---------- import from Excel: THE EMPLOYEE SHEET (13-11-2026) ----------
+  // the headings are matched with the sheet's columns (letters and digits only, any case). "Name of Company" and "Branch Name" stand
+  // once for a group of rows in the company's sheet – they are carried down. A row without a code and a name (a total) is left out.
+  var normH = function (v) { return String(v === undefined || v === null ? '' : v).toLowerCase().replace(/[^a-z0-9ऀ-ॿ]/g, ''); };
+  function mapRows(table, cols) {
+    if (!table.length) return { rows: [], cols: [], unknown: [] };
+    var head = table[0].map(function (h) { return String(h === null || h === undefined ? '' : h).trim(); }), map = {}, read = [], unknown = [];
+    head.forEach(function (h, i) { var n = normH(h); if (!n) return; var c = cols.filter(function (x) { return x.names.indexOf(n) > -1; })[0]; if (c && !(c.key in map)) { map[c.key] = i; read.push(h); } else if (!c) unknown.push(h); });
+    var keys = Object.keys(map), last = {}, rows = [];
+    table.slice(1).forEach(function (r, i) {
+      var o = { _line: i + 2 }, any = false;
+      keys.forEach(function (k) { var v = r[map[k]]; v = v === undefined || v === null ? '' : v; var c = cols.filter(function (x) { return x.key === k; })[0]; if (c.fill) { if (String(v).trim() !== '') last[k] = v; else v = last[k] === undefined ? '' : last[k]; } o[k] = v; });
+      ['code', 'name'].forEach(function (k) { if (o[k] !== undefined && String(o[k]).trim() !== '') any = true; });
+      if (any) rows.push(o);
+    });
+    return { rows: rows, cols: read, unknown: unknown, hasName: 'name' in map, hasProject: 'project' in map };
+  }
+  function csv(text) { var out = [], row = [], cur = '', q = false; for (var i = 0; i < text.length; i++) { var c = text[i]; if (q) { if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += c; } else if (c === '"') q = true; else if (c === ',') { row.push(cur); cur = ''; } else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cur); out.push(row); row = []; cur = ''; } else cur += c; } if (cur !== '' || row.length) { row.push(cur); out.push(row); } return out; }
+  function xlsxLib() { return new Promise(function (ok) { if (window.XLSX) return ok(true); var s = document.createElement('script'); s.src = '/vendor/xlsx-0.18.5.full.min.js'; s.onload = function () { ok(!!window.XLSX); }; s.onerror = function () { ok(false); }; document.head.appendChild(s); }); }
+  function importFile(file) {
+    if (!file) return; $('i_err').hidden = true; $('i_res').hidden = true; $('i_save').hidden = true; S.imp = null; S.impPart = '';
+    var bad = function (t) { $('i_err').textContent = t; $('i_err').hidden = false; };
+    var done = function (table) {
+      api('sheetCols').then(function (c) {
+        var m = mapRows(table, c.cols);
+        if (!m.hasName) return bad('The first row of the file must have the column names, and one of them "Employee Name". Press "Download the format" to get the file with every column.');
+        if (!m.rows.length) return bad('The file has no employee rows.');
+        // the company's sheet holds the people of several projects: which of them belong to THIS site is chosen here – the others wait
+        var by = {}; if (m.hasProject) m.rows.forEach(function (r) { var k = String(r.project).trim(); by[k] = (by[k] || 0) + 1; });
+        var names = Object.keys(by);
+        if (names.length > 1) return projects(m, names, by);
+        check(m, m.rows);
+      }, function (e) { bad(e.message); });
+    };
+    if (/\.csv$/i.test(file.name)) { file.text().then(function (t) { done(csv(t.replace(/^﻿/, ''))); }); return; }
+    xlsxLib().then(function (ok) {
+      if (!ok) return bad('An Excel file can be read only when HR is opened inside the ERP (lion.sketchline.si). Or save the sheet as CSV and choose that.');
+      file.arrayBuffer().then(function (buf) { var wb = window.XLSX.read(buf, { type: 'array' }), sh = wb.Sheets[wb.SheetNames[0]]; S.impPart = window.HRSHEET ? window.HRSHEET.partOf(wb.SheetNames[0]) : ''; done(window.XLSX.utils.sheet_to_json(sh, { header: 1, raw: true, defval: '' })); }, function () { bad('The file could not be read.'); });
+    });
+  }
+  function projects(m, names, by) {
+    var box = $('i_res'); box.textContent = '';
+    box.appendChild(el('p', 'sum', 'This file has the people of ' + names.length + ' projects. Tick the project(s) whose people belong to THIS site (' + S.init.site + ') – the others are not imported here.'));
+    var ul = el('ul', 'faults'), ticks = [];
+    names.sort(function (a, b) { return by[b] - by[a]; }).forEach(function (n) { var li = el('li'), lb = el('label'), cb = el('input'); cb.type = 'checkbox'; cb.value = n; ticks.push(cb); lb.appendChild(cb); lb.appendChild(el('span', '', ' ' + (n || '(no project)') + ' – ' + by[n] + ' people')); li.appendChild(lb); ul.appendChild(li); });
+    box.appendChild(ul);
+    var go = el('button', 'pri', 'Check these people'); go.type = 'button'; go.id = 'i_proj';
+    go.onclick = function () { var pick = ticks.filter(function (t) { return t.checked; }).map(function (t) { return t.value; }); if (!pick.length) { $('i_err').textContent = 'Tick at least one project.'; $('i_err').hidden = false; return; } $('i_err').hidden = true; check(m, m.rows.filter(function (r) { return pick.indexOf(String(r.project).trim()) > -1; }), m.rows.length); };
+    box.appendChild(go); box.hidden = false;
+  }
+  function check(m, rows, of) {
+    if (S.impPart) { rows = rows.filter(function (r) { return Object.keys(r).some(function (k) { return k !== 'code' && k !== 'name' && k !== '_line' && k !== 'project' && String(r[k] === undefined || r[k] === null ? '' : r[k]).trim() !== ''; }); }); if (!rows.length) { $('i_err').textContent = 'Nothing is filled in this file yet – only the codes and names are there.'; $('i_err').hidden = false; return; } }
+    if (rows.length > 1000) { $('i_err').textContent = 'The file has ' + rows.length + ' rows – at most 1000 in one file. Split it.'; $('i_err').hidden = false; return; }
+    S.imp = rows; var held = of ? of - rows.length : 0;
+    api('sheetImport', { rows: rows, check: 1, part: S.impPart || '' }).then(function (r) { importShow(r, m, held); }, function (e) { $('i_err').textContent = e.message; $('i_err').hidden = false; });
+  }
+  function importShow(r, m, held) {
+    var box = $('i_res'); box.textContent = '';
+    box.appendChild(el('p', 'sum', r.checked ? r.rows + ' rows read · ' + r.toAdd + ' new employees' + (r.incomplete ? ' (' + r.incomplete + ' of them incomplete – the date of birth missing)' : '') + ' · ' + r.toChange + ' employees of today are changed' + (r.same ? ' · ' + r.same + ' stay the same' : '') + ' · ' + r.faults + ' with a fault (not saved).'
+      : r.added + ' employees added · ' + r.changed + ' changed' + (r.same ? ' · ' + r.same + ' the same (not written)' : '') + ' · ' + r.faults + ' not saved' + (r.salaries ? ' · ' + r.salaries + ' salaries set' : '') + '.'));
+    /* (19-11-2026, asked: "export karel … changes krel mg employee code aso ki baki gosti prt tich import krel tr je changes zalet tech updet
+     * hoil") the check shows, employee by employee, what will change – then Save; a changed date of birth / joining date asks one reason */
+    if (r.checked && r.changes && r.changes.length) {
+      box.appendChild(el('p', 'sum', 'What will change:')); var cu = el('ul', 'faults chg');
+      r.changes.slice(0, 300).forEach(function (c) { var li = el('li'); li.appendChild(el('b', '', 'Line ' + c.line + ' – ' + c.code + ' – ' + c.name + ': ')); var sp = el('span', '', c.what.join(' · ')); sp.setAttribute('data-noi18n', ''); li.appendChild(sp); cu.appendChild(li); });
+      box.appendChild(cu); if (r.changes.length > 300) box.appendChild(el('p', 'muted', '… and ' + (r.changes.length - 300) + ' more employees change.'));
+    }
+    if (r.checked && !r.toAdd && !r.toChange && r.same && !r.faults) box.appendChild(el('p', 'muted', 'Nothing changes – the file is the same as HR.'));
+    if (r.checked && r.needReason) {
+      var rl = el('label', '', 'Why do the dates of birth / joining change? (kept with the change)'); rl.setAttribute('for', 'i_reason'); rl.style.cssText = 'display:block;font-weight:600;margin:10px 0 4px';
+      var ri = el('input'); ri.id = 'i_reason'; ri.maxLength = 300; ri.placeholder = 'e.g. corrected from the Aadhaar card'; ri.style.width = '100%'; box.appendChild(rl); box.appendChild(ri); S.impWhy = ri;
+    }
+    if (held) box.appendChild(el('p', 'muted', held + ' people of the other projects are not imported here.'));
+    if (m && m.cols.length) box.appendChild(el('p', 'muted', 'Columns read (' + m.cols.length + '): ' + m.cols.join(', ')));
+    if (m && m.unknown.length) box.appendChild(el('p', 'muted', 'Columns NOT read (not of the sheet): ' + m.unknown.join(', ')));
+    (r.notes || []).forEach(function (n) { box.appendChild(el('p', 'muted', n)); });
+    if (r.checked && r.willMake && r.willMake.length) box.appendChild(el('p', 'muted', 'Will be added to the lists: ' + r.willMake.join(', ')));
+    if (r.made && r.made.length) box.appendChild(el('p', 'muted', 'Added to the lists: ' + r.made.join(', ')));
+    if (r.lines.length) { var ul = el('ul', 'faults'); r.lines.slice(0, 200).forEach(function (l) { var li = el('li'); li.appendChild(el('b', '', 'Line ' + l.line + (l.code ? ' – ' + l.code : '') + (l.name ? ' – ' + l.name : '') + ': ')); li.appendChild(el('span', '', l.why)); ul.appendChild(li); }); box.appendChild(ul); if (r.lines.length > 200) box.appendChild(el('p', 'muted', '… and ' + (r.lines.length - 200) + ' more lines with a fault.')); }
+    var n = r.toAdd + r.toChange; box.hidden = false; $('i_save').hidden = !(r.checked && n > 0); $('i_save').textContent = 'Save ' + n + ' employees';
+  }
+  function importSave() { var b = $('i_save'); if (!S.imp) return; var ri = S.impWhy && S.impWhy.isConnected ? S.impWhy : null, why = ri ? ri.value.trim() : ''; if (ri && why.length < 5) { $('i_err').textContent = 'Write why the dates change (at least 5 letters).'; $('i_err').hidden = false; ri.focus(); return; } $('i_err').hidden = true; busy(b, true); api('sheetImport', { rows: S.imp, part: S.impPart || '', reason: why }).then(function (r) { busy(b, false); S.imp = null; $('i_file').value = ''; importShow(r, null, 0); toast(r.added + ' added, ' + r.changed + ' changed.'); if ((r.people || []).length) autoSigninSay(r.people); if ((r.moved || []).length) signinMoved(r.moved); api('init').then(function (i) { S.init = i; list(); }); }, function (e) { busy(b, false); $('i_err').textContent = e.message; $('i_err').hidden = false; }); }
+
+  // ---------- Departments / Designations ----------
+  /* (13-11-2026, asked: "department and designation ektr thew … add kelel edit and delet pn karta yawet … design change kr …
+   * construction line madhe je astat te auto tu fill kr") DEPARTMENTS AND DESIGNATIONS ON ONE PAGE, side by side: a name is read
+   * as a line; Edit turns it into its boxes; Switch off / on as before; Delete only what no employee has (the server checks –
+   * one in use is switched off). "Add the usual construction list" adds the names that are not there yet. */
+  function masters() {
+    var root = $('m_two'), M = S.mast || (S.mast = { q: '', edit: '', del: '' }); root.textContent = '';
+    var tools = el('div', 'tools'), q = el('input'); q.type = 'search'; q.placeholder = 'Search a department or a designation'; q.setAttribute('aria-label', 'Search'); q.value = M.q; q.oninput = function () { M.q = q.value; draw(); }; tools.appendChild(q);
+    var seed = el('button', 'sec', 'Add the usual construction list'); seed.type = 'button'; seed.title = 'Adds the usual departments and designations of a road / construction company – only the names that are not in the lists yet';
+    seed.onclick = function () { if (!seed.dataset.sure) { seed.dataset.sure = '1'; seed.textContent = 'Sure? Press again – only missing names are added'; return; } var was = 'Add the usual construction list'; seed.disabled = true; seed.textContent = 'Adding…';
+      api('masterSeed', {}).then(function (r) { took(r); said('Added', r.added.departments + ' departments and ' + r.added.designations + ' designations' + (r.added.departments + r.added.designations ? '' : ' – everything was there already')); masters(); }, function (e) { seed.disabled = false; seed.textContent = was; delete seed.dataset.sure; fail(e); }); };
+    tools.appendChild(seed); root.appendChild(tools);
+    var two = el('div', 'ms-two'); root.appendChild(two);
+    var took = function (r) { S.init.departments = r.departments; S.init.designations = r.designations; }, said = function (t, sub) { if (window.HRPROF && window.HRPROF.saved) window.HRPROF.saved(t, sub); else toast(t + (sub ? ' – ' + sub : '')); };
+    var send = function (b, action, body, word, sub) { var was = b.textContent; b.disabled = true; b.textContent = action === 'masterDelete' ? 'Deleting…' : 'Saving…'; api(action, body).then(function (r) { took(r); M.edit = ''; M.del = ''; said(word, sub); masters(); }, function (e) { b.disabled = false; b.textContent = was; fail(e); }); };
+    function card(kind, title, list) {
+      var c = el('div', 'dz-card ms-card'), words = M.q.trim().toLowerCase(), rows = list.filter(function (x) { return !words || x.name.toLowerCase().indexOf(words) > -1 || (kind === 'designation' && (CAT[x.category] || '').toLowerCase().indexOf(words) > -1); });
+      var h = el('h3', '', title); h.appendChild(el('span', 'dz-link', rows.length + (words ? ' of ' + list.length : ''))); c.appendChild(h);
+      var add = el('div', 'ms-add'), nm = el('input'), cat = null; nm.maxLength = 60; nm.placeholder = 'New ' + kind + ' – its name'; nm.setAttribute('aria-label', 'New ' + kind); add.appendChild(nm);
+      if (kind === 'designation') { cat = catPick('staff'); add.appendChild(cat); }
+      var ab = el('button', 'pri', '+ Add'); ab.type = 'button'; var go = function () { send(ab, 'masterSave', cat ? { kind: kind, name: nm.value, category: cat.value } : { kind: kind, name: nm.value }, 'Added', nm.value.trim()); }; ab.onclick = go; nm.onkeydown = function (ev) { if (ev.key === 'Enter') go(); }; add.appendChild(ab); c.appendChild(add);
+      var ul = el('ul', 'ms-rows');
+      rows.forEach(function (x) {
+        var li = el('li', x.active ? '' : 'off'), key = kind + ':' + x.id;
+        if (M.edit === key) {
+          var inp = el('input'); inp.value = x.name; inp.maxLength = 60; inp.setAttribute('aria-label', 'Name'); li.appendChild(inp); var ec = kind === 'designation' ? catPick(x.category || 'staff') : null; if (ec) li.appendChild(ec);
+          var sv = el('button', 'sm', 'Save'); sv.type = 'button'; var doSave = function () { send(sv, 'masterSave', ec ? { kind: kind, id: x.id, name: inp.value, category: ec.value } : { kind: kind, id: x.id, name: inp.value }, 'Saved', inp.value.trim()); }; sv.onclick = doSave; inp.onkeydown = function (ev) { if (ev.key === 'Enter') doSave(); if (ev.key === 'Escape') { ev.stopPropagation(); M.edit = ''; masters(); } }; li.appendChild(sv);
+          var ca = el('button', 'sm ghost', 'Cancel'); ca.type = 'button'; ca.onclick = function () { M.edit = ''; masters(); }; li.appendChild(ca); ul.appendChild(li); setTimeout(function () { inp.focus(); }, 0); return;
+        }
+        var t = el('span', 'ms-nm', x.name); li.appendChild(t); if (kind === 'designation') li.appendChild(el('span', 'ms-cat c-' + (x.category || 'staff'), CAT[x.category] || 'Staff')); if (!x.active) li.appendChild(el('span', 'st s-left', 'Off'));
+        var acts = el('span', 'ms-acts'), ed = el('button', 'sm ghost', 'Edit'); ed.type = 'button'; ed.onclick = function () { M.edit = key; M.del = ''; masters(); }; acts.appendChild(ed);
+        var tg = el('button', 'sm ghost', x.active ? 'Switch off' : 'Switch on'); tg.type = 'button'; tg.title = x.active ? 'Not offered for a new employee any more – it stays where it is chosen' : 'Offered again'; tg.onclick = function () { send(tg, 'masterSave', { kind: kind, id: x.id, name: x.name, active: !x.active }, x.active ? 'Switched off' : 'Switched on', x.name); }; acts.appendChild(tg);
+        var dl = el('button', 'sm ghost ms-del', M.del === key ? 'Sure? Delete' : 'Delete'); dl.type = 'button'; dl.title = 'Only a name that no employee has – one in use is switched off'; dl.onclick = function () { if (M.del !== key) { M.del = key; M.edit = ''; masters(); return; } send(dl, 'masterDelete', { kind: kind, id: x.id }, 'Deleted', x.name); }; acts.appendChild(dl);
+        li.appendChild(acts); ul.appendChild(li);
+      });
+      c.appendChild(ul); if (!rows.length) c.appendChild(el('p', 'none', list.length ? 'Nothing matches.' : 'Nothing in this list yet.')); return c;
+    }
+    function catPick(v) { var c = el('select'); c.setAttribute('aria-label', 'Category'); Object.keys(CAT).forEach(function (k) { var o = el('option', '', CAT[k]); o.value = k; c.appendChild(o); }); c.value = v; return c; }
+    function draw() { two.textContent = ''; two.appendChild(card('department', 'Departments', S.init.departments)); two.appendChild(card('designation', 'Designations', S.init.designations)); }
+    draw();
+  }
+
+  function show(id) { $(id).hidden = false; } function hide(id) { $(id).hidden = true; }
+  /* (13-11-2026, an employee is ONE full page) a window of his that is closed WITHOUT saving (Change, Transfer, Relieve, Delete)
+   * goes back to his page – not to the list. The small windows (sign-in, KYC, documents) open over his page and leave it there. */
+  function back(d) { if ({ dlg_form: 1, dlg_tr: 1, dlg_exit: 1, dlg_del: 1 }[d] && S.open && S.open.employee && (d !== 'dlg_form' || $('f_id').value) && $('dlg_emp').hidden && S.page === 'employees') openEmp(S.open.employee.id); }
+
+  window.HR = {
+    open: function (me, page) {
+      S.me = me; if (S.init) return; var nb = $('nav_back'); if (nb) nb.onclick = stepBack;
+      
+      // "My HR" (an employee for himself): his attendance is in the phone app – the office's pages are not his
+      if (me && me.user && me.user.role === 'self') { window.HRMSG('Your attendance is marked in the phone app (One Click Solution → HR). These pages are for the HR office. · तुमची हजेरी phone app मध्ये लावायची आहे. ही pages HR office साठी आहेत. · आपकी हाज़िरी phone app में लगानी है। ये pages HR office के लिए हैं।'); return; }
+      api('init').then(function (i) {
+        S.init = i; $('app').hidden = false;
+        var t; $('q').oninput = function () { clearTimeout(t); t = setTimeout(function () { S.q = $('q').value; list(); }, 300); };
+        $('cat').onchange = function () { S.category = $('cat').value; list(); };
+        $('b_add').onclick = function () { form(null, null); }; $('b_imp').onclick = function () { $('i_file').value = ''; $('i_err').hidden = true; $('i_res').hidden = true; $('i_save').hidden = true; importSteps(); show('dlg_imp'); };
+        $('d_edit').onclick = function () { form(S.open.employee, S.open.boss); }; $('d_tr').onclick = transfer; $('d_exit').onclick = exit; $('d_del').onclick = del; $('d_prof').onclick = function () { if (S.prof && S.profFirst) { S.prof.open(S.profFirst); $('dlg_emp').scrollTop = 0; } }; $('del_form').onsubmit = delSave; $('b_exp').onclick = exportList;
+        $('d_login').onclick = login; $('lg_go').onclick = loginGive; $('b_signin').hidden = !S.init.signin; $('b_signin').onclick = signinOpen; $('sg_go').onclick = signinGo; $('d_salary').onclick = function () { if (window.HRPAY) window.HRPAY.sheet(S.open.employee); }; $('d_facebtn').onclick = function () { if (window.HRMUS && window.HRMUS.face) window.HRMUS.face(S.open.employee); };
+        $('d_kyc').onclick = kyc; $('d_docs').onclick = docs; $('k_form').onsubmit = kycSave; $('o_add').onclick = docAdd; $('o_na_add').onclick = docNaAsk; $('o_ev').onclick = docEvents;
+        $('f_form').onsubmit = save; $('t_form').onsubmit = transferSave; $('x_form').onsubmit = exitSave;
+        var bt; $('f_boss').oninput = function () { clearTimeout(bt); bt = setTimeout(pickBoss, 250); }; $('f_dob').addEventListener('input', whyBox); $('f_join').addEventListener('input', whyBox);
+        $('i_file').onchange = function () { importFile($('i_file').files[0]); }; $('i_save').onclick = importSave; $('i_fmt').onclick = formatFile;
+        Array.prototype.forEach.call(document.querySelectorAll('[data-close]'), function (b) { b.onclick = function () { hide(b.dataset.close); back(b.dataset.close); if (b.dataset.close === 'dlg_login') { $('lg_pw').textContent = ''; $('lg_done').hidden = true; } }; });      // (the one-time password leaves the page with its box)
+        document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') ['dlg_form', 'dlg_tr', 'dlg_exit', 'dlg_del', 'dlg_login', 'dlg_imp', 'dlg_kyc', 'dlg_docs', 'dlg_emp'].some(function (d) { if (!$(d).hidden) { hide(d); back(d); return true; } return false; }); });
+        go(page || (window.HRDASH ? 'dashboard' : 'employees'));
+      }, function (e) { window.HRMSG(e.message); });
+    },
+    emp: function (id) { go('employees'); openEmp(id); },
+    go: function (page) { go(page); }, signin: function (list) { return autoSigninSay(list); }, pages: function () { return S.init ? pages() : []; }, lists: function () { return S.init ? { departments: S.init.departments || [], designations: S.init.designations || [] } : null; }, badges: function () { if (S.init) tabs(); },      // an employee's page, from the muster's day panel
+    _mapRows: mapRows, _csv: csv, _dmy: dmy
+  };
+})();

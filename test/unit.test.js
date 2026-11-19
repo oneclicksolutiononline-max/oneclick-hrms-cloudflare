@@ -1,0 +1,1356 @@
+// HR – Phase 1a: the Portal's ticket is checked (signature, issuer, module, time), used ONCE, and HR's own sign-in starts.
+// No real database and no network: the Portal's key is made here; "fetch" is answered here by a small stand-in of the database.
+'use strict';
+const test = require('node:test'), assert = require('node:assert'), crypto = require('crypto'), fs = require('fs'), path = require('path');
+const root = path.join(__dirname, '..');
+const PORTAL = 'https://portal.test/portal', DBURL = 'https://db.test';
+process.env.PORTAL_URL = PORTAL; process.env.PUBLIC_URL = 'https://main.test/hr'; process.env.SUPABASE_URL = DBURL; process.env.SUPABASE_SECRET_KEY = 'test-key-not-a-real-one';
+const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+const jwk = Object.assign(publicKey.export({ format: 'jwk' }), { kid: 'k1', alg: 'ES256', use: 'sig' });
+// the stand-in database: tables of rows, with each table's key (a second row with the same key is refused, as Postgres does)
+const DB = { hr_tickets: [], hr_sessions: [], hr_people: [], hr_audit: [] }, KEY = { hr_tickets: ['jti'], hr_sessions: ['id_hash'], hr_people: ['site', 'email'], hr_audit: ['id'] };
+let dbOff = false, auditId = 0;
+const answer = (status, body) => ({ ok: status >= 200 && status < 300, status, text: async () => body === undefined ? '' : JSON.stringify(body), json: async () => body });
+global.fetch = async (u, opt) => {
+  u = String(u); opt = opt || {};
+  if (u === PORTAL + '/api/jwks') return answer(200, { keys: [jwk] });
+  assert.ok(u.startsWith(DBURL + '/rest/v1/'), 'only the Portal\'s keys and the HR database are asked: ' + u);
+  assert.strictEqual(opt.headers.apikey, 'test-key-not-a-real-one');
+  const url = new URL(u), table = url.pathname.split('/').pop(), rows = DB[table];
+  if (dbOff || !rows) return answer(404, { code: 'PGRST205', message: 'Could not find the table' });
+  const match = r => [...url.searchParams].every(([k, v]) => k === 'select' || k === 'on_conflict' || (v.startsWith('eq.') ? String(r[k]) === v.slice(3) : v.startsWith('lt.') ? String(r[k]) < v.slice(3) : true));
+  if (opt.method === 'GET') return answer(200, rows.filter(match));
+  if (opt.method === 'DELETE') { DB[table] = rows.filter(r => !match(r)); return answer(204); }
+  if (opt.method === 'POST') {
+    for (const r of JSON.parse(opt.body)) {
+      if (table === 'hr_audit') r.id = ++auditId;
+      const i = rows.findIndex(x => KEY[table].every(k => x[k] === r[k]));
+      if (i > -1 && /merge-duplicates/.test(String(opt.headers.Prefer || ''))) rows[i] = Object.assign({}, rows[i], r);
+      else if (i > -1) return answer(409, { code: '23505', message: 'duplicate key value violates unique constraint' });
+      else rows.push(r);
+    }
+    return answer(201);
+  }
+  return answer(405);
+};
+const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url');
+function ticket(over, key, head) {
+  const now = Math.floor(Date.now() / 1000);
+  const c = Object.assign({ iss: PORTAL, aud: 'hr', sub: 'a@b.test', name: 'A Person', site: 'S1', siteName: 'Site One', role: 'user', iat: now, exp: now + 60, jti: crypto.randomBytes(16).toString('hex'), mods: [{ key: 'hr', name: 'HR', url: 'https://main.test/hr' }], sites: [{ code: 'S1', name: 'Site One' }] }, over || {});
+  const h = b64(head || { alg: 'ES256', kid: 'k1', typ: 'JWT' }), b = b64(c);
+  return h + '.' + b + '.' + crypto.sign('sha256', Buffer.from(h + '.' + b), { key: key || privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+}
+const portal = require('../lib/portal');
+
+test('the Portal\'s ticket: accepted only with its signature, made by this Portal, for "hr", in its minute', async () => {
+  const c = await portal.verify(ticket());
+  assert.deepStrictEqual([c.email, c.name, c.site, c.siteName, c.role], ['a@b.test', 'A Person', 'S1', 'Site One', 'user']);
+  assert.strictEqual((await portal.verify(ticket({ super: true, role: 'admin' }))).role, 'super');
+  // (18-11-2026) the e-mail he verified at the Portal and his mobile number – kept only when they are what they say
+  const lm = await portal.verify(ticket({ login: 'Real.Person@Mail.TEST', mobile: '9876543210' })); assert.deepStrictEqual([lm.login, lm.mobile], ['real.person@mail.test', '9876543210']);
+  const bad = await portal.verify(ticket({ login: 'not an e-mail', mobile: '12345' })); assert.deepStrictEqual([bad.login, bad.mobile, c.login, c.mobile], ['', '', '', '']);
+  assert.strictEqual(portal.AUD, 'hr');
+  const other = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey;
+  const no = async (t, re) => { await assert.rejects(() => portal.verify(t), e => { assert.strictEqual(e.status, 401); assert.match(e.message, re); return true; }); };
+  await no(ticket({}, other), /signature does not match/);
+  await no(ticket({ aud: 'purchase' }), /made for another module/);
+  await no(ticket({ aud: 'store' }), /made for another module/);
+  await no(ticket({ iss: 'https://evil.test/portal' }), /made by another Portal/);
+  const now = Math.floor(Date.now() / 1000);
+  await no(ticket({ iat: now - 300, exp: now - 240 }), /ran out/);
+  await no(ticket({ iat: now, exp: now + 3600 }), /no proper time/);
+  await no(ticket({ sub: 'not-an-email' }), /no proper email/);
+  await no(ticket({ site: 'bad site' }), /no proper site/);
+  await no(ticket({ role: 'owner' }), /no proper role/);
+  await no(ticket({ jti: 'x' }), /no ticket number/);
+  await no(ticket({}, privateKey, { alg: 'none', kid: 'k1' }), /not a ticket of the Portal/);
+  await no(ticket({}, privateKey, { alg: 'ES256', kid: 'unknown' }), /unknown key/);
+  await no('abc', /not a ticket/);
+  const t = ticket().split('.'); t[1] = b64({ iss: PORTAL, aud: 'hr', sub: 'x@y.test', site: 'S1', role: 'admin', super: true });
+  await no(t.join('.'), /signature does not match/);      // (a changed ticket)
+});
+
+const call = async (file, method, headers, body) => { const res = { h: {}, setHeader(k, v) { this.h[k] = v; }, end(b) { this.body = JSON.parse(b); } }; await require('../api/' + file)({ method, headers: headers || {}, body }, res); return res; };
+const PAGE = { 'x-rcl': '1', host: 'rcl-hr.test', 'x-forwarded-proto': 'https' };
+const cookieOf = r => String(r.h['Set-Cookie'] || '').split(';')[0];
+
+test('POST /api/sso: a ticket is used ONCE; HR\'s own sign-in starts (a fingerprint only in the database); who signed in is written down', async () => {
+  const t = ticket({ name: 'B Person', role: 'admin' });
+  let r = await call('sso', 'POST', PAGE, { ticket: t });
+  assert.strictEqual(r.statusCode, 200);
+  assert.deepStrictEqual([r.body.ok, r.body.user, r.body.site, r.body.siteName, r.body.portal], [true, { email: 'a@b.test', name: 'B Person', role: 'admin' }, 'S1', 'Site One', PORTAL]);
+  const ck = cookieOf(r); assert.match(String(r.h['Set-Cookie']), /^rcl_hr=[A-Za-z0-9_-]{30,}; Path=\/; HttpOnly; SameSite=Lax; Max-Age=900; Secure$/);
+  assert.strictEqual(DB.hr_sessions.length, 1); const token = decodeURIComponent(ck.split('=')[1]);
+  assert.strictEqual(DB.hr_sessions[0].id_hash, crypto.createHash('sha256').update(token).digest('hex'), 'the database keeps the fingerprint');
+  assert.ok(!JSON.stringify(DB).includes(token), 'never the sign-in itself');
+  assert.deepStrictEqual(DB.hr_people.map(p => [p.site, p.email, p.name, p.role]), [['S1', 'a@b.test', 'B Person', 'admin']]);
+  assert.deepStrictEqual(DB.hr_audit.map(a => [a.site, a.email, a.action]), [['S1', 'a@b.test', 'Sign-in']]);
+  // the same ticket again: refused, no second sign-in
+  r = await call('sso', 'POST', PAGE, { ticket: t });
+  assert.strictEqual(r.statusCode, 401); assert.match(r.body.error, /this ticket was already used/); assert.strictEqual(DB.hr_sessions.length, 1);
+  // who is signed in; another browser (no cookie): nobody
+  r = await call('me', 'GET', Object.assign({ cookie: ck }, PAGE));
+  assert.deepStrictEqual([r.body.signedIn, r.body.user.role, r.body.site, r.body.portal], [true, 'admin', 'S1', PORTAL]);
+  assert.deepStrictEqual((await call('me', 'GET', PAGE)).body, { signedIn: false, portal: PORTAL });
+  assert.strictEqual((await call('me', 'GET', Object.assign({ cookie: 'rcl_hr=' + 'x'.repeat(43) }, PAGE))).body.signedIn, false, 'a made-up cookie');
+  // the open page's fresh ticket (renew): the sign-in is replaced, the person is not written down again
+  r = await call('sso', 'POST', Object.assign({ cookie: ck }, PAGE), { ticket: ticket({ name: 'B Person', role: 'admin' }), renew: 1 });
+  assert.strictEqual(r.statusCode, 200); const ck2 = cookieOf(r); assert.notStrictEqual(ck2, ck);
+  assert.strictEqual(DB.hr_sessions.length, 1, 'the older sign-in is gone'); assert.strictEqual(DB.hr_audit.length, 1, 'not written again');
+  assert.strictEqual((await call('me', 'GET', Object.assign({ cookie: ck }, PAGE))).body.signedIn, false, 'the older cookie opens nothing');
+  // a sign-in older than its 15 minutes ends
+  DB.hr_sessions[0].expires_at = new Date(Date.now() - 1000).toISOString();
+  assert.strictEqual((await call('me', 'GET', Object.assign({ cookie: ck2 }, PAGE))).body.signedIn, false); assert.strictEqual(DB.hr_sessions.length, 0);
+  // sign out
+  r = await call('sso', 'POST', PAGE, { ticket: ticket() }); const ck3 = cookieOf(r);
+  r = await call('logout', 'POST', Object.assign({ cookie: ck3 }, PAGE), {});
+  assert.strictEqual(r.statusCode, 200); assert.match(String(r.h['Set-Cookie']), /^rcl_hr=; .*Max-Age=0/); assert.strictEqual(DB.hr_sessions.length, 0);
+  // only from HR's own page; a wrong ticket starts nothing
+  assert.strictEqual((await call('sso', 'GET', PAGE)).statusCode, 405);
+  assert.strictEqual((await call('sso', 'POST', { host: 'rcl-hr.test' }, { ticket: ticket() })).statusCode, 403, 'without the page\'s own header');
+  assert.strictEqual((await call('sso', 'POST', Object.assign({}, PAGE, { origin: 'https://evil.test' }), { ticket: ticket() })).statusCode, 403, 'from another web page');
+  assert.strictEqual((await call('sso', 'POST', Object.assign({}, PAGE, { host: 'rcl-hr.vercel.app', origin: 'https://main.test' }), { ticket: ticket() })).statusCode, 200, 'the one address (PUBLIC_URL) is ours');
+  const n = DB.hr_sessions.length; r = await call('sso', 'POST', PAGE, { ticket: ticket({ aud: 'store' }) });
+  assert.strictEqual(r.statusCode, 401); assert.strictEqual(DB.hr_sessions.length, n);
+});
+
+test('before the SQL step is run: a clear message, no fault; nobody is signed in', async () => {
+  dbOff = true;
+  try {
+    const r = await call('sso', 'POST', PAGE, { ticket: ticket() });
+    assert.strictEqual(r.statusCode, 500); assert.match(r.body.error, /The HR database is not set up yet: the Super Admin runs sql\/hr_step1_base\.sql once in the rcl-hr Supabase/);
+    assert.deepStrictEqual((await call('me', 'GET', Object.assign({ cookie: 'rcl_hr=' + 'y'.repeat(43) }, PAGE))).body, { signedIn: false, portal: PORTAL });
+  } finally { dbOff = false; }
+});
+
+test('the SQL step: only adds, four tables, row level security on and nothing for anon / authenticated, no other database\'s table', () => {
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step1_base.sql'), 'utf8').replace(/--.*$/gm, '');
+  assert.deepStrictEqual((sql.match(/create table if not exists public\.(\w+)/g) || []).map(x => x.split('.')[1]), ['hr_people', 'hr_sessions', 'hr_tickets', 'hr_audit']);
+  assert.ok(!/\b(drop|truncate|delete from|update |alter table (?!public\.%I enable row level security))/i.test(sql), 'nothing is changed or removed');
+  assert.match(sql, /foreach t in array array\['hr_people', 'hr_sessions', 'hr_tickets', 'hr_audit'\] loop\s+execute format\('alter table public\.%I enable row level security', t\);\s+execute format\('revoke all on public\.%I from public, anon, authenticated', t\);/);
+  assert.ok(!/\b(users|access|sites|modules|master|log_book|diesel|store_|eng_|pur_)\w*\b/i.test(sql.replace(/hr_\w+/g, '')), 'no table of the Portal or of another module');
+});
+
+test('the menu, the page and the hosting: one page, nothing of an employee, never listed by a search engine, Mumbai', async () => {
+  const menu = require('../api/menu'); const res = { h: {}, setHeader(k, v) { this.h[k] = v; }, end(b) { this.body = JSON.parse(b); } };
+  await menu({ method: 'GET', headers: {} }, res);
+  assert.deepStrictEqual(res.body, { module: 'hr', name: 'HR', pages: [{ key: 'dashboard', name: 'Dashboard' }, { key: 'employees', name: 'Employees' }, { key: 'attendance', name: 'Attendance' }, { key: 'places', name: 'Work places' }, { key: 'muster', name: 'Muster' }, { key: 'requests', name: 'Requests' }, { key: 'phones', name: 'Phones' }, { key: 'rulebook', name: 'Rule Book' }, { key: 'leave', name: 'Leave' }, { key: 'month', name: 'Month verification' }, { key: 'payroll', name: 'Payroll' }, { key: 'lists', name: 'Lists' }, { key: 'departments', name: 'Departments' }, { key: 'designations', name: 'Designations' }] }, 'nobody signed in here yet: every page is listed');
+  assert.ok(menu.mayOpen('all', 'user') && !menu.mayOpen('admin', 'user') && menu.mayOpen('admin', 'admin') && menu.mayOpen('admin', 'super'));
+  const page = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), v = JSON.parse(fs.readFileSync(path.join(root, 'vercel.json'), 'utf8'));
+  for (const m of page.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)) new Function(m[1]);
+  assert.match(page, /<meta name="robots" content="noindex, nofollow">/);
+  assert.match(page, /history\.replaceState\(null, '', location\.pathname \+ location\.search \+ pg\)/, 'the ticket leaves the address bar');
+  assert.match(page, /var pg = hashArg\('page'\); pg = \/\^\[a-z0-9_-\]\{1,40\}\$\/i\.test\(pg\) \? '#page=' \+ pg : '';/, '(step 13) only the plain name of the page stays – never the ticket');
+  assert.match(page, /fetch\(BASE \+ path,/, 'relative: also under <main>/hr/'); assert.match(page, /\/api\/go\?module=hr&site=/);
+  assert.deepStrictEqual(v.regions, ['bom1']);
+  const all = v.headers.find(h => h.source === '/(.*)').headers, get = k => (all.find(h => h.key === k) || {}).value;
+  assert.strictEqual(get('X-Robots-Tag'), 'noindex, nofollow'); assert.strictEqual(get('X-Frame-Options'), 'SAMEORIGIN');
+  assert.match(get('Content-Security-Policy'), /frame-ancestors 'self'/);
+});
+
+test('the employee\'s details: four categories; mobile and e-mail made tidy; DOB and e-mail compulsory – without them INCOMPLETE; under 18 refused', () => {
+  const R = require('../lib/rules'), now = Date.UTC(2026, 10, 12, 6);
+  assert.deepStrictEqual(R.CATS, ['staff', 'operator', 'driver', 'labour']);
+  assert.deepStrictEqual(['+91 98765-43210', '09876543210', '919876543210', '9876543210', '', '12345', '5876543210', 'abc'].map(R.mobile), ['9876543210', '9876543210', '9876543210', '9876543210', '', null, null, null]);
+  assert.deepStrictEqual([' A@B.Co ', '', 'no-at', 'a@b'].map(R.email), ['a@b.co', '', null, null]);
+  assert.deepStrictEqual(['05-03-1990', '5/3/1990', '1990-03-05', 32937, '', '31-02-2000', 'soon'].map(R.date), ['1990-03-05', '1990-03-05', '1990-03-05', '1990-03-05', '', null, null]);
+  assert.strictEqual(R.today(Date.UTC(2026, 10, 11, 19, 0)), '2026-11-12', 'the day in India, not in UTC');
+  assert.strictEqual(R.age('2008-11-13', now), 17); assert.strictEqual(R.age('2008-11-12', now), 18);
+  let e = R.employee({ name: '  Test   Person ', category: 'Labor', mobile: '09876543210', email: 'T@X.in', dob: '12-11-2008', joined_on: '12-11-2026' }, now);
+  assert.deepStrictEqual(e, { row: { name: 'Test Person', category: 'labour', gender: '', mobile: '9876543210', email: 't@x.in', joined_on: '2026-11-12', dob: '2008-11-12' }, errors: [], missing: [] });
+  // (18-11-2026, Phase 2 – the master prompt Part 4) 18 ON THE JOINING DATE: the 18th birthday or later; born on 29 February – 1 March
+  assert.match(R.employee({ name: 'Test Person', category: 'staff', dob: '12-11-2008', joined_on: '01-04-2026' }, now).errors.join(' '), /under 18 on the joining date – born on or before 01-04-2008/);
+  assert.deepStrictEqual(R.employee({ name: 'Test Person', category: 'staff', dob: '12-11-2008', joined_on: '01-04-2026' }, now, { dob: '2008-11-12', joined_on: '2026-04-01' }).errors, [], 'an employee of today, his dates not changed: the check of before (18 today)');
+  assert.match(R.employee({ name: 'Test Person', category: 'staff', dob: '12-11-2008', joined_on: '01-04-2026' }, now, { dob: '2008-11-12', joined_on: '2026-05-01' }).errors.join(' '), /under 18 on the joining date/, 'a date changed: the new rule');
+  assert.deepStrictEqual([R.turns('2008-02-29', 18), R.turns('2008-03-01', 18), R.turns('2008-02-28', 18)], ['2026-03-01', '2026-03-01', '2026-02-28']);
+  assert.deepStrictEqual([R.adultOn('2008-02-29', '2026-02-28'), R.adultOn('2008-02-29', '2026-03-01'), R.adultOn('2008-11-12', '2026-11-12'), R.adultOn('2008-11-13', '2026-11-12')], [false, true, true, false]);
+  assert.deepStrictEqual([R.latestDob('2026-11-12'), R.latestDob('2028-02-29')], ['2008-11-12', '2010-02-28']);
+  assert.match(R.employee({ name: 'Test Person', category: 'staff', dob: '13-11-2008' }, now).errors.join(' '), /under 18 today – born on or before 12-11-2008/);
+  assert.strictEqual(R.statusOf(e.row, ''), 'pending', 'complete – never active by itself');
+  assert.match(fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'), /pending: 'Complete'/, '(13-11-2026) shown as "Complete" – not "Waiting for OTP"');
+  e = R.employee({ name: 'Test Person', category: 'driver' }, now); assert.deepStrictEqual(e.errors, []); assert.deepStrictEqual(e.missing, ['Date of birth', 'Mobile or e-mail']); assert.strictEqual(R.statusOf(e.row, ''), 'incomplete');
+  // (13-11-2026) he signs in with his e-mail OR his mobile number: one of them, with the date of birth, makes him complete
+  for (const one of [{ mobile: '9876543210' }, { email: 'a@b.co' }]) { const c = R.employee(Object.assign({ name: 'Test Person', category: 'driver', dob: '01-01-1990' }, one), now); assert.deepStrictEqual([c.missing, R.statusOf(c.row, '')], [[], 'pending']); }
+  assert.match(R.employee({ name: 'Test Person', category: 'staff', dob: '13-11-2008' }, now).errors.join(' '), /under 18/);
+  assert.match(R.employee({ name: 'T', category: 'manager', mobile: '12', email: 'x', dob: 'y' }, now).errors.join(' '), /Name: .*Category: .*Mobile: .*E-mail: .*Date of birth: /);
+  assert.strictEqual(R.statusOf(e.row, 'left'), 'left'); assert.strictEqual(R.statusOf(e.row, 'active'), 'active');
+});
+
+test('the pages\' script: the Excel / CSV columns are found by their usual names; a person\'s text is never put in as HTML', () => {
+  const src = fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'), win = {}; new Function('window', 'document', src)(win, { getElementById: () => null });
+  // (13-11-2026) the headings are matched with the columns of the employee sheet (lib/act_sheet.js) – also the names of a file of before
+  const cols = require('../lib/act_sheet').colsOut();
+  const m = win.HR._mapRows([['Sr', 'Employee Name', 'Category', 'Mobile No', 'E-mail ID', 'Date of Birth', 'DOJ', 'Dept', 'Designation'], [1, 'A One', 'Staff', '9876543210', 'a@b.co', '01-01-1990', 45000, 'Accounts', 'Clerk'], ['', '', '', '', '', '', '', '', '']], cols);
+  assert.deepStrictEqual(m.rows, [{ _line: 2, name: 'A One', category: 'Staff', mobile: '9876543210', email: 'a@b.co', dob: '01-01-1990', joined_on: 45000, department: 'Accounts', designation: 'Clerk' }]);
+  assert.deepStrictEqual(m.unknown, ['Sr']); assert.ok(m.hasName); assert.ok(!win.HR._mapRows([['Naam', 'Kind'], ['x', 'y']], cols).hasName);
+  assert.deepStrictEqual(win.HR._csv('Name,Category\r\n"One, A","Staff"\n"Say ""hi""",Driver\n'), [['Name', 'Category'], ['One, A', 'Staff'], ['Say "hi"', 'Driver']]);
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write/.test(src), 'only textContent');
+  const page = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), ids = [...new Set([...src.matchAll(/\$\('([a-z_0-9]+)'\)/g)].map(x => x[1]))];
+  ids.forEach(i => assert.ok(page.includes('id="' + i + '"'), 'the page has #' + i));
+});
+
+test('the actions: every one asks the sign-in first; the Admin\'s ones are refused to an HR User; nothing deletes an employee', () => {
+  const src = fs.readFileSync(path.join(root, 'api', 'hr.js'), 'utf8'), { ACT } = require('../api/hr');
+  assert.deepStrictEqual(Object.keys(ACT), ['init', 'masterSave', 'empList', 'empGet', 'empPick', 'empSave', 'empTransfer', 'empExit', 'empDelete', 'empExport', 'privGet', 'privSave', 'docList', 'docUploadUrl', 'docAdd', 'docLink', 'empPhotos', 'docRemove', 'signinPeople',
+    'signinLinked', 'empImport', 'placeList', 'projSave', 'placeSave', 'placeBulk', 'placeImport', 'placeRemove', 'placeMap', 'placePeople', 'placePerson', 'placeGuest', 'placeAnywhere', 'placeAccess', 'placeAccessSet', 'devList', 'devRelease',
+    'punchDay', 'punchSelfie', 'punchReview', 'myAttend', 'selfieUrl', 'punch', 'attSetup', 'shiftSave', 'shiftRemove', 'holidaySave', 'holidayRemove', 'rulesSave', 'powerSet', 'muster', 'empAround', 'dayGet', 'daySet', 'regList',
+    'regDecide', 'myMonth', 'regAsk', 'myRegs', 'teamRegs', 'teamRegDecide', 'attDash', 'profGet', 'profSave', 'profRowSave', 'profRowRemove', 'listAll', 'listSave', 'profRequiredSave', 'myLeave', 'leaveAsk', 'leaveChange', 'leaveCancel',
+    'teamLeaves', 'teamLeaveDecide', 'leaveList', 'leaveEdit', 'leaveRemove', 'leaveRemoveMany', 'leaveDecide', 'leaveBalances', 'leaveAdjust', 'leaveZero', 'leavePolicy', 'leavePolicySave', 'monthList', 'monthVerify', 'monthReturn', 'monthApprove', 'monthReopen', 'monthSites', 'hoList',
+    'hoSet', 'salaryGet', 'salaryAsk', 'salaryWaiting', 'salaryDecide', 'payList', 'payFlags', 'payAdjust', 'payLock', 'paySettings', 'paySettingsSave', 'advList', 'advGive', 'advClose', 'mySlips', 'hrComing', 'paySlipOf', 'payBank',
+    'sheetCols', 'sheetImport', 'sheetExport', 'masterDelete', 'masterSeed', 'empPage', 'rbList', 'rbSave', 'rbClose', 'rbDelete', 'rbDefault', 'rbAssign', 'rbPeople', 'rbOf', 'rbDayOff', 'askList', 'askDecide', 'askCancel',
+    'extraFind', 'extraAsk', 'leaveOpening', 'leaveCreditAsk', 'leaveLedger', 'attImport', 'attImports', 'myLeavePaperUrl', 'myLeaveFiles', 'myLeaveFileUrl', 'myLeaveFileAdd', 'myLeaveFileLink', 'myLeaveFileRemove', 'leaveFiles', 'leaveFileUrl',
+    'leaveFileAdd', 'leaveFileLink', 'leaveFileRemove', 'langSet', 'bankList', 'bankDecide', 'holdList', 'holdSave', 'holdRelease', 'repPick', 'repGet', 'repSet', 'repEnd', 'docQueue', 'docTake', 'docVerify', 'docNa', 'docEvents',
+    'insGet', 'insSave', 'insVerify', 'cpList', 'cpSave', 'cpFileUrl', 'cpVersionSave', 'cpPublish', 'cpDraftDelete', 'cpFileLink', 'cpAccepts', 'myPolicies', 'myPolicyAccept', 'myPolicyFile', 'docRuleGet', 'docRuleSave',
+    'docRuleList', 'docOverride', 'docOverrideEnd', 'myPlaces', 'noticeList', 'noticeSettingSave', 'noticeRetry', 'noticeCancel', 'myNotices', 'myNoticeSeen', 'structList', 'structSave',
+    'structVersionSave', 'structApprove', 'payEmpSet', 'statChecks', 'statCheck', 'payRelease', 'payReleaseSet', 'payPaid', 'fnfList', 'fnfMake', 'fnfSave', 'fnfStep', 'payRegister', 'payCompare', 'repCatalog', 'repRun', 'myTeam', 'aiStatus', 'aiReadDoc', 'aiAsk', 'aiChecks', 'helpAsk', 'invMake', 'invList', 'invGet', 'invResend', 'invCancel', 'invDecide',
+    'emailCheckSend', 'empActivate', 'myHr', 'myDocs', 'myDocUploadUrl', 'myDocAdd', 'myDocLink']);
+  assert.match(src, /const s = Object\.assign\(\{\}, ses\.as\(await ses\.need\(req\), x\.as_site\), \{ origin: String\(req\.headers\.origin \|\| ''\) \}\), att = [^\n]+\n[^\n]+\n[^\n]+\n  if \(s\.role === 'self' && SELF\.indexOf\(String\(x\.action\)\) < 0\) throw fail\(403, 'This is for the HR office only\.', 'role'\);\n[^\n]+\n  await DR\.guard\(s, x\.action, ATT\.me\);\n[^\n]+\n  PG\.guard\(s, x\.action, SELF\);\n  try \{ send\(res, 200, Object\.assign\(\{ ok: true \}, await fn\(s, x\)\)\); \}/);
+  for (const a of ['masterSave', 'empTransfer', 'empExit', 'empDelete', 'docRemove']) assert.match(String(ACT[a]), /needAdmin\(s\)/, a);
+  // (12-11-2026) ONE action deletes: empDelete – an employee added by mistake, after the check that nothing hangs on him, with the reason, written in the audit
+  const dels = src.match(/db\('DELETE'/g) || [], del = String(ACT.empDelete); assert.strictEqual(dels.length, (del.match(/db\('DELETE'/g) || []).length, 'only empDelete deletes');
+  assert.ok(del.indexOf('needAdmin(s)') < del.indexOf("db('DELETE'") && del.indexOf("'inuse'") < del.indexOf("db('DELETE'") && del.indexOf('Reason: write why he is deleted.') < del.indexOf("db('DELETE'"), 'the role, the reason and the check come before any delete');
+  for (const t of ['hr_punches', 'hr_day_entries', 'hr_regularize', 'hr_devices', 'hr_device_tries', 'hr_employee_docs']) { assert.ok(del.indexOf("db('GET', '" + t + "?select=id&' + q)") > -1, t + ' is looked at first'); assert.ok(del.indexOf("'" + t + "'") < 0 || !new RegExp("DELETE[^;]*" + t).test(del), t + ' is never deleted'); }
+  assert.match(del, /await audit\(s\.site, s\.email, 'Employee deleted'/);
+});
+
+test('SQL step 2: only adds; row level security; a mobile and an e-mail belong to one employee; no other database\'s table', () => {
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step2_employees.sql'), 'utf8').replace(/--.*$/gm, '');
+  assert.deepStrictEqual((sql.match(/create table if not exists public\.(\w+)/g) || []).map(x => x.split('.')[1]), ['hr_departments', 'hr_designations', 'hr_employees', 'hr_employment', 'hr_numbers']);
+  assert.ok(!/\b(drop |truncate|delete from)/i.test(sql));
+  assert.match(sql, /create unique index if not exists hr_employees_mobile on public\.hr_employees \(mobile\) where mobile <> ''/); assert.match(sql, /create unique index if not exists hr_employees_email on public\.hr_employees \(email\) where email <> ''/);
+  assert.match(sql, /check \(category in \('staff', 'operator', 'driver', 'labour'\)\)/); assert.match(sql, /check \(status in \('incomplete', 'pending', 'active', 'left'\)\)/);
+  assert.match(sql, /foreach t in array array\['hr_departments', 'hr_designations', 'hr_employees', 'hr_employment', 'hr_numbers'\] loop\s+execute format\('alter table public\.%I enable row level security', t\);\s+execute format\('revoke all on public\.%I from public, anon, authenticated', t\);/);
+  assert.match(sql, /revoke all on function public\.hr_next_no\(text, int\) from public, anon, authenticated;/);
+});
+
+test('his own details and papers: Aadhaar with its check digit, masked; PAN; the kinds of papers; a driver needs his licence', () => {
+  const R = require('../lib/rules'); let ok = ''; for (let i = 0; i < 10; i++) if (R.aadhaar('99990000111' + i)) ok = '99990000111' + i;      // a made-up number, not a person's
+  assert.match(ok, /^\d{12}$/); assert.strictEqual(R.aadhaar(ok.replace(/(\d{4})(\d{4})/, '$1 $2 ')), ok); assert.strictEqual(R.aadhaarMask(ok), 'XXXX XXXX ' + ok.slice(-4)); assert.strictEqual(R.aadhaarMask(''), '');
+  for (let i = 0; i < 10; i++) if (String(i) !== ok[11]) assert.strictEqual(R.aadhaar(ok.slice(0, 11) + i), null, 'a wrong last digit is caught');
+  assert.deepStrictEqual(['', '12345', '099900001119', 'abcd'].map(R.aadhaar), ['', null, null, null]);
+  assert.deepStrictEqual(['abcde1234f', ' ABCDE1234F ', '', 'ABCDE12345', 'abc'].map(R.pan), ['ABCDE1234F', 'ABCDE1234F', '', null, null]);
+  const p = R.personal({ aadhaar: ok, pan: 'abcde1234f', mobile2: '+91 9876543210', family_name: ' A  Parent ', family_relation: 'Father', family_mobile: '09876543211', address_current: ' Camp ', address_permanent: '' });
+  assert.deepStrictEqual(p, { row: { aadhaar: ok, pan: 'ABCDE1234F', mobile2: '9876543210', family_mobile: '9876543211', family_name: 'A Parent', family_relation: 'father', address_current: 'Camp', address_permanent: '' }, errors: [] });
+  assert.deepStrictEqual(R.DOCS.map(d => d.key), ['photo', 'aadhaar', 'pan', 'education', 'licence', 'bank_passbook', 'salary_slip', 'experience', 'other', 'caste', 'insurance']);
+  assert.deepStrictEqual(R.DOCS.filter(d => d.pay).map(d => d.key), ['bank_passbook', 'salary_slip'], 'the pay papers: only the Admin opens them');
+  assert.deepStrictEqual(R.DOCS.filter(d => d.restricted).map(d => d.key), ['caste'], '(step 15) the caste certificate: only the Admin opens it');
+  assert.deepStrictEqual(R.docsMissing('driver', ['photo', 'aadhaar', 'pan', 'bank_passbook']), ['Driving licence']); assert.deepStrictEqual(R.docsMissing('labour', ['photo', 'aadhaar', 'pan', 'bank_passbook']), []);
+  assert.deepStrictEqual(Object.keys(R.DOC_TYPES), ['image/jpeg', 'image/png', 'image/webp', 'application/pdf']); assert.strictEqual(R.DOC_MAX, 10485760);
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step3_kyc_docs.sql'), 'utf8').replace(/--.*$/gm, '');
+  assert.deepStrictEqual((sql.match(/create table if not exists public\.(\w+)/g) || []).map(x => x.split('.')[1]), ['hr_employee_private', 'hr_employee_docs']); assert.ok(!/\b(drop |truncate|delete from)/i.test(sql));
+  assert.match(sql, /values \('hr-docs', 'hr-docs', false, 10485760, array\['image\/jpeg', 'image\/png', 'image\/webp', 'application\/pdf'\]\)/, 'a PRIVATE bucket');
+  assert.match(sql, /grant select, insert, update on public\.%I to service_role/, 'no delete: a paper is removed, never erased');
+  // (step 15 widens the check with the caste certificate and the medical insurance)
+  const sql15 = fs.readFileSync(path.join(root, 'sql', 'hr_step15_employee.sql'), 'utf8').replace(/--.*$/gm, '');
+  R.DOCS.forEach(d => assert.ok(sql.includes("'" + d.key + "'") || /^(caste|insurance)$/.test(d.key) && sql15.includes("'" + d.key + "'"), d.key + ' in the table\'s check'));
+  const src = fs.readFileSync(path.join(root, 'api', 'hr.js'), 'utf8');
+  assert.match(src, /aadhaar: isAdmin\(s\) \? \(p\.aadhaar \|\| ''\) : ''/, 'an HR User never gets the whole Aadhaar');
+  assert.match(src, /k === 'aadhaar' \|\| k === 'pan' \? \['…' \+ String\(o\)\.slice\(-4\), '…' \+ String\(c\.row\[k\]\)\.slice\(-4\)\]/, 'the record of changes holds only the last four');
+  const v = JSON.parse(fs.readFileSync(path.join(root, 'vercel.json'), 'utf8')); assert.match(v.headers[0].headers.find(h => h.key === 'Content-Security-Policy').value, /connect-src 'self' https:\/\/\*\.supabase\.co;/, 'a file is sent straight to the private store');
+  const win = {}; new Function('window', 'document', fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'))(win, { getElementById: () => null });
+  assert.deepStrictEqual(['2026-11-12', '2026-11-11T20:00:00Z', '2026-11-11T10:00:00+00:00', ''].map(win.HR._dmy), ['12-11-2026', '12-11-2026', '11-11-2026', ''], 'a moment is shown as its day in India');
+});
+
+test('no secret and no code of another HR product in any file', () => {
+  const files = []; (function walk(d) { for (const f of fs.readdirSync(d)) { if (f === '.git' || f === 'node_modules') continue; const p = path.join(d, f); if (fs.statSync(p).isDirectory()) walk(p); else if (/\.(js|json|html|md|sql)$/.test(f)) files.push(p); } })(root);
+  assert.ok(files.length >= 8);
+  for (const f of files) {
+    const t = fs.readFileSync(f, 'utf8');
+    assert.ok(!/sb_secret_[A-Za-z0-9_-]{8,}|eyJhbGciOi[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|re_[A-Za-z0-9]{20,}/.test(t), path.relative(root, f) + ': a key');
+    assert.ok(!/[a-z0-9]{12,}\.supabase\.co/.test(t), path.relative(root, f) + ': the database\'s address belongs in Vercel only');
+  }
+});
+
+/* ───────────── step 4: attendance ───────────── */
+test('where a person is: a circle, an area, along the road – inside or how many metres outside', () => {
+  const G = require('../lib/geo'), c = { shape: 'circle', lat: 18.5, lng: 73.8, radius_m: 100 };
+  assert.ok(Math.abs(G.dist(18.5, 73.8, 18.5009, 73.8) - 100.08) < 0.5);
+  assert.deepStrictEqual(G.check(c, 18.5005, 73.8), { inside: true, distance: 0 }); const out = G.check(c, 18.502, 73.8); assert.ok(!out.inside && Math.abs(out.distance - 122) <= 1);
+  const sq = { shape: 'polygon', points: [[18.5, 73.8], [18.5, 73.81], [18.51, 73.81], [18.51, 73.8]] };
+  assert.ok(G.check(sq, 18.505, 73.805).inside); const o2 = G.check(sq, 18.505, 73.811); assert.ok(!o2.inside && Math.abs(o2.distance - 105) <= 2);
+  const road = { shape: 'corridor', radius_m: 50, points: [[18.5, 73.8], [18.5, 73.9]] };
+  assert.ok(G.check(road, 18.5003, 73.85).inside); assert.ok(!G.check(road, 18.501, 73.85).inside); assert.ok(!G.check(road, 18.5, 73.91).inside, 'past the end of the road');
+  assert.strictEqual(G.points([[1, 2]], 2), null); assert.strictEqual(G.points([[1, 2], [91, 2]], 2), null); assert.deepStrictEqual(G.points([{ lat: '1', lng: 2 }, [3, 4]], 2), [[1, 2], [3, 4]]);
+  assert.strictEqual(G.nearest([c, Object.assign({}, c, { lat: 19 })], 18.5001, 73.8).place, c);
+});
+
+test('a work place as typed; for whom it is; the moment of a punch sent later', () => {
+  const A = require('../lib/attend');
+  assert.match(A.place({ name: 'C', shape: 'circle', radius_m: 5 }).errors.join(' '), /Name.*Place it on the map.*Radius: 20 to 5000/);
+  assert.match(A.place({ name: 'Area', shape: 'polygon', points: [[1, 1], [2, 2]] }).errors.join(' '), /at least 3 corners/);
+  assert.match(A.place({ name: 'Camp', lat: 1, lng: 1, radius_m: 100, scope: 'category', scope_values: ['boss'] }).errors.join(' '), /at least one category/);
+  const p = { id: 'p1', active: true, removed_at: null, valid_from: '2026-11-10', scope: 'category', scope_values: ['labour'] }, lab = { category: 'labour', department_id: 'd1' }, st = { category: 'staff', department_id: 'd1' };
+  assert.deepStrictEqual([A.applies(p, lab, '2026-11-12'), A.applies(p, st, '2026-11-12'), A.applies(p, lab, '2026-11-09'), A.applies(Object.assign({}, p, { active: false }), lab, '2026-11-12'), A.applies(Object.assign({}, p, { removed_at: 'x' }), lab, '2026-11-12')], [true, false, false, false, false]);
+  assert.deepStrictEqual([A.applies(Object.assign({}, p, { scope: 'people' }), st, '2026-11-12', { p1: 1 }), A.applies(Object.assign({}, p, { scope: 'people' }), st, '2026-11-12', {}), A.applies(Object.assign({}, p, { scope: 'department', scope_values: ['d1'] }), st, '2026-11-12')], [true, false, true]);
+  const now = Date.UTC(2026, 10, 12, 6), base = { offline: true, anchor_server: now - 3600000, anchor_elapsed: 1000000, elapsed: 2800000, at_device: new Date(now - 1800000 + 5000).toISOString() };
+  assert.deepStrictEqual(A.moment({}, now), { at: now, ok: true, why: [] }, 'online: the server\'s clock only');
+  assert.deepStrictEqual([A.moment(base, now).ok, A.moment(base, now).at], [true, now - 1800000]);
+  assert.match(A.moment(Object.assign({}, base, { elapsed: 5000 }), now).why.join(), /restarted/);
+  assert.match(A.moment(Object.assign({}, base, { at_device: new Date(now).toISOString() }), now).why.join(), /does not agree/, 'the phone\'s clock was changed');
+  assert.match(A.moment(Object.assign({}, base, { anchor_server: now - 80 * 3600000, at_device: new Date(now - 79.5 * 3600000).toISOString() }), now).why.join(), /older than 72 hours/);
+  assert.strictEqual(A.moment({ offline: true }, now).ok, false);
+});
+
+test('attendance actions: the office\'s ones are closed to "My HR"; changes are the Admin\'s; a punch is never changed', () => {
+  const { ACT, SELF } = require('../api/hr'), src = fs.readFileSync(path.join(root, 'lib', 'act_attend.js'), 'utf8');
+  assert.deepStrictEqual(SELF, ['myAttend', 'selfieUrl', 'punch', 'myMonth', 'regAsk', 'myRegs', 'teamRegs', 'teamRegDecide', 'myLeave', 'leaveAsk', 'leaveChange', 'leaveCancel', 'teamLeaves', 'teamLeaveDecide', 'myHr', 'myDocs', 'myDocUploadUrl', 'myDocAdd', 'myDocLink', 'mySlips', 'myLeavePaperUrl', 'myLeaveFiles', 'myLeaveFileUrl', 'myLeaveFileAdd', 'myLeaveFileLink', 'myLeaveFileRemove', 'myPolicies', 'myPolicyAccept', 'myPolicyFile', 'myPlaces', 'myNotices', 'myNoticeSeen', 'myTeam']);
+  for (const [a, p] of [['projSave', 'places'], ['placeSave', 'places'], ['placeGuest', 'places'], ['placeBulk', 'places'], ['placeImport', 'places'], ['placeRemove', 'places'], ['placePeople', 'places'], ['placePerson', 'places'], ['placeAccessSet', 'places'], ['devRelease', 'phones'], ['punchReview', 'review'], ['shiftSave', 'shifts'], ['shiftRemove', 'shifts'], ['holidaySave', 'shifts'], ['holidayRemove', 'shifts'], ['rulesSave', 'shifts'], ['regDecide', 'regularize']]) assert.ok(String(ACT[a]).indexOf("await power.need(s, '" + p + "')") > -1, a + ': the power ' + p);
+  assert.match(String(ACT.daySet), /await power\.need\(s, has \? 'correct' : 'manual'\)/); assert.match(String(ACT.powerSet), /s\.role !== 'super'/);
+  for (const a of ['placeList', 'placeMap', 'devList', 'punchDay', 'punchSelfie', 'attSetup', 'muster', 'empAround', 'dayGet', 'daySet', 'regList', 'attDash']) assert.match(String(ACT[a]), /needOffice\(s\)/, a);
+  for (const a of SELF) assert.match(String(ACT[a]), /const (emp|boss) = await me\(s\)/, a + ': only for the employee the sign-in is');
+  assert.ok(!/db\('(PATCH|DELETE)', 'hr_punch/.test(src), 'no punch and no decision is changed or deleted');
+  assert.deepStrictEqual([...new Set(src.match(/db\('DELETE', '(\w+)/g))], ["db('DELETE', 'hr_place_people"], 'only "for whom" of a place is taken back');
+  // (14-11-2026) work places of another site for a person of this site: given by his own site's office; the other site's place is not touched
+  assert.match(src, /async placeGuest\(s, x\) \{\s+await power\.need\(s, 'places'\); const eid = \(await peopleOk\(s, \[x\.employee_id\]\)\)\[0\]/, 'an employee of THIS site, by who may manage work places');
+  assert.match(src, /hr_places\?select=id,site,name&site=neq\.' \+ enc\(s\.site\)/, 'only places of OTHER sites');
+  assert.ok(!/placeGuest[\s\S]{0,1600}db\('(PATCH|POST)', 'hr_places/.test(src), 'no place is changed by it');
+  assert.match(src, /const had = await ownOf\(s, /, 'an office replaces only its own people of a place – a guest of another site stays');
+  const mus = fs.readFileSync(path.join(root, 'lib', 'act_muster.js'), 'utf8'); assert.deepStrictEqual(mus.match(/db\('DELETE', '(\w+)/g), ["db('DELETE', 'hr_shift_people"]); assert.ok(!/db\('PATCH', 'hr_(punch|day_entries|att_rules)/.test(mus), 'a punch, a day\'s entry and a rule version are never changed');
+  const P = require('../lib/portal'); assert.deepStrictEqual([P.AUD, P.AUD_SELF], ['hr', 'hrme']);
+});
+
+test('SQL step 4: only adds; row level security; a punch can only be added; one phone a person', () => {
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step4_attendance.sql'), 'utf8').replace(/--.*$/gm, '');
+  assert.deepStrictEqual((sql.match(/create table if not exists public\.(\w+)/g) || []).map(x => x.split('.')[1]), ['hr_projects', 'hr_places', 'hr_place_people', 'hr_devices', 'hr_device_tries', 'hr_punches', 'hr_punch_reviews']);
+  assert.ok(!/\b(drop table|drop column|truncate|delete from)/i.test(sql)); assert.deepStrictEqual((sql.match(/drop constraint (\w+)/g) || []), ['drop constraint hr_sessions_role_check', 'drop constraint hr_people_role_check'], 'only the two role lists are widened');
+  assert.match(sql, /grant select, insert on public\.hr_device_tries, public\.hr_punches, public\.hr_punch_reviews to service_role;/);
+  assert.match(sql, /foreach t in array array\['hr_projects', 'hr_places', 'hr_place_people', 'hr_devices', 'hr_device_tries', 'hr_punches', 'hr_punch_reviews'\] loop\s+execute format\('alter table public\.%I enable row level security', t\);\s+execute format\('revoke all on public\.%I from public, anon, authenticated', t\);/);
+  assert.match(sql, /client_id text not null unique/); assert.match(sql, /values \('hr-selfies', 'hr-selfies', false, 1048576, array\['image\/jpeg'\]\)/);
+  assert.ok(!/\b(portal_|users\b|access\b|vehicles|store_|eng_|pur_)/.test(sql.replace(/hr_\w+/g, '')), 'nothing of another database');
+});
+
+test('the attendance pages: the script runs; three pages; a person\'s text only as text; the menu lists them, not for "My HR"', () => {
+  const src = fs.readFileSync(path.join(root, 'public', 'att.js'), 'utf8'), win = {}; new Function('window', 'document', src)(win, { getElementById: () => null });
+  assert.deepStrictEqual(win.HRATT.pages.map(p => p[0]), ['attendance', 'places', 'phones']); assert.ok(win.HRATT.has('places') && !win.HRATT.has('employees'));
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|\b(alert|confirm|prompt)\(/.test(src), 'only textContent, no browser dialog');
+  assert.strictEqual(win.HRATT._size({ shape: 'corridor', radius_m: 60 }), '60 m each side of the road');
+  assert.strictEqual(win.HRATT._whom({ scope: 'category', scope_values: ['labour', 'driver'] }, { departments: [] }), 'Labour, Driver');
+  // (13-11-2026) who marks where: where a person marked last, in words
+  assert.strictEqual(win.HRATT._last({ last: { place_id: 'p1', day: '2026-11-13', time: '08:24', kind: 'in' } }, { today: '2026-11-13', places: [{ id: 'p1', name: 'Site office' }] }), 'Site office · today 08:24 IN');
+  assert.strictEqual(win.HRATT._last({ last: null }, { today: '2026-11-13', places: [] }), '–');
+  assert.match(src, /e\.code === 'scope' && !body\.convert/, 'a place for everybody is changed only after the Admin said yes');
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'); for (const id of src.match(/\$\('([a-z_0-9]+)'\)/g).map(x => x.slice(3, -2))) assert.ok(html.indexOf('id="' + id + '"') > -1, 'the page has #' + id);
+  const M = require('../api/menu'); assert.deepStrictEqual(M.PAGES.map(p => p.key), ['dashboard', 'employees', 'attendance', 'places', 'muster', 'requests', 'phones', 'rulebook', 'leave', 'month', 'payroll', 'lists', 'departments', 'designations']);      // (18-11-2026) "Shifts & rules" is a part of the Rule Book
+  assert.deepStrictEqual([M.mayOpen('all', 'user'), M.mayOpen('admin', 'user'), M.mayOpen('all', 'self'), M.mayOpen('admin', 'super')], [true, false, false, true]);
+  const v = JSON.parse(fs.readFileSync(path.join(root, 'vercel.json'), 'utf8')).headers[0].headers.find(h => h.key === 'Content-Security-Policy').value;
+  assert.match(v, /img-src 'self' data: https:\/\/tile\.openstreetmap\.org https:\/\/\*\.supabase\.co https:\/\/i\.ibb\.co;/);      // (13-11-2026) the company's logo, the same picture as the ERP's assert.match(v, /script-src 'self' 'unsafe-inline';/);
+  assert.match(fs.readFileSync(path.join(root, 'public', 'vendor', 'leaflet', 'LICENSE.txt'), 'utf8'), /BSD 2-Clause License/);
+});
+
+/* ───────────── step 5: the muster ───────────── */
+test('one day: present / half / absent by the hours, late and early by the shift, weekly off, holiday, at work, IN without OUT; no rule = nothing applied', () => {
+  const D = require('../lib/day'), day = '2026-11-10', today = '2026-11-12', t = h => D.at(day, h);
+  assert.deepStrictEqual(D.status({ day, today, in: t('09:00'), out: t('18:00') }), { code: 'P', hours: 9, late_min: 0, early_min: 0 }, 'no rules: IN and OUT = present');
+  const r = D.rules({ full_hours: 8, half_hours: '4', grace_min: 10, early_min: 0, late_to_half: 3, week_off: [0, '0', 9] }); assert.deepStrictEqual(r.errors, []); assert.deepStrictEqual(r.rules.week_off, [0]);
+  const sh = { start_time: '09:00', end_time: '18:00', break_min: 60 };
+  assert.deepStrictEqual(D.status({ day, today, in: t('09:11'), out: t('18:00'), rules: r.rules, shift: sh }), { code: 'HD', hours: 7.82, late_min: 11, early_min: 0 });
+  assert.strictEqual(D.status({ day, today, in: t('09:10'), out: t('18:10'), rules: r.rules, shift: sh }).code, 'P'); assert.strictEqual(D.status({ day, today, in: t('09:00'), out: t('12:00'), rules: r.rules, shift: sh }).code, 'A');
+  assert.strictEqual(D.status({ day, today, in: t('09:00'), out: t('17:30'), rules: r.rules, shift: sh }).early_min, 30);
+  assert.deepStrictEqual(['2026-11-10', '2026-11-08'].map(d => D.status({ day: d, today, in: null, rules: r.rules }).code), ['A', 'WO']); assert.strictEqual(D.status({ day: '2026-11-08', today, in: t('09:00'), out: t('18:00'), rules: r.rules }).code, 'WOP');
+  assert.deepStrictEqual([D.status({ day, today, in: null, holiday: 'Festival' }).code, D.status({ day, today, in: t('09:00'), out: t('18:00'), holiday: 'Festival' }).code], ['H', 'HP']);
+  assert.deepStrictEqual([D.status({ day: today, today, in: null }).code, D.status({ day: today, today, in: 1 }).code, D.status({ day, today, in: t('09:00') }).code, D.status({ day: '2026-11-13', today, in: null }).code], ['', 'IN', 'MIS', '']);
+  assert.deepStrictEqual(D.status({ day, today, in: t('20:05'), out: D.at('2026-11-11', '05:00'), rules: { grace_min: 10, early_min: 15 }, shift: { start_time: '20:00', end_time: '06:00' } }), { code: 'P', hours: 8.92, late_min: 0, early_min: 60 }, 'a night shift ends the next morning');
+  assert.match(D.rules({ full_hours: 4, half_hours: 6 }).errors.join(), /less than/); assert.match(D.rules({ grace_min: 5.5 }).errors.join(), /Grace minutes/);
+  assert.deepStrictEqual(D.shift({ name: 'General', start_time: '9:00', end_time: '18:00' }).row, { name: 'General', start_time: '09:00', end_time: '18:00', auto_out: null, break_min: 0 }); assert.match(D.shift({ name: 'G', start_time: '9', end_time: '25:00' }).errors.join(' '), /Name.*Starts at.*Ends at/);
+});
+
+test('the version of the day; a person\'s most exact shift; a month\'s count', () => {
+  const D = require('../lib/day'), day = '2026-11-10';
+  assert.strictEqual(D.validOn([{ valid_from: '2026-01-01', n: 1 }, { valid_from: '2026-11-11', n: 2 }], day).n, 1, 'a day is measured with the version of that day'); assert.strictEqual(D.validOn([{ valid_from: '2026-11-11' }], day), null);
+  assert.strictEqual(D.validOn([{ valid_from: '2026-01-01', created_at: '2026-01-01T00:00:00Z', n: 1 }, { valid_from: '2026-01-01', created_at: '2026-02-01T00:00:00Z', n: 2 }], day).n, 2, 'the same date twice: the one made later');
+  const S = [{ id: 'a', scope: 'all', valid_from: '2026-01-01', active: true }, { id: 'c', scope: 'category', scope_values: ['labour'], valid_from: '2026-01-01', active: true }, { id: 'p', scope: 'people', valid_from: '2026-01-01', active: true }, { id: 'x', scope: 'all', valid_from: '2026-12-01', active: true }, { id: 'o', scope: 'department', scope_values: ['d1'], valid_from: '2026-01-01', active: false }];
+  assert.deepStrictEqual([D.shiftOf(S, { category: 'labour' }, day, {}).id, D.shiftOf(S, { category: 'staff', department_id: 'd1' }, day, {}).id, D.shiftOf(S, { category: 'labour' }, day, { p: 1 }).id, D.shiftOf([], {}, day, {})], ['c', 'a', 'p', null]);
+  assert.deepStrictEqual(D.total([{ code: 'P', late_min: 5 }, { code: 'P', late_min: 5 }, { code: 'HD', late_min: 9 }, { code: 'A' }, { code: 'WO' }, { code: 'H' }, { code: 'WOP' }, { code: 'MIS' }, { code: '' }], { late_to_half: 3 }), { P: 3, HD: 1, A: 1, WO: 1, H: 1, MIS: 1, late: 3, paid: 5, late_half: 1 });
+  assert.strictEqual(D.total([{ code: 'P', late_min: 5 }], {}).paid, 1, 'no rule for late coming: nothing taken off');
+});
+
+test('SQL step 5: only adds; row level security; a rule version and a day\'s entry can only be added; the powers; the pages', () => {
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step5_muster.sql'), 'utf8').replace(/--.*$/gm, '');
+  assert.deepStrictEqual((sql.match(/create table if not exists public\.(\w+)/g) || []).map(x => x.split('.')[1]), ['hr_shifts', 'hr_shift_people', 'hr_holidays', 'hr_att_rules', 'hr_regularize', 'hr_day_entries', 'hr_admin_powers']);
+  assert.ok(!/\b(drop |truncate|delete from|alter table public\.hr_(?!shifts|shift_people|holidays|att_rules|regularize|day_entries|admin_powers))/i.test(sql), 'nothing of the steps before is touched');
+  assert.match(sql, /grant select, insert on public\.hr_att_rules, public\.hr_day_entries to service_role;/); assert.match(sql, /create unique index if not exists hr_regularize_one_waiting on public\.hr_regularize \(employee_id, day\) where status = 'pending'/);
+  assert.match(sql, /foreach t in array array\['hr_shifts', 'hr_shift_people', 'hr_holidays', 'hr_att_rules', 'hr_regularize', 'hr_day_entries', 'hr_admin_powers'\] loop\s+execute format\('alter table public\.%I enable row level security', t\);\s+execute format\('revoke all on public\.%I from public, anon, authenticated', t\);/);
+  const P = require('../lib/powers'); assert.deepStrictEqual(P.KEYS, ['places', 'phones', 'review', 'shifts', 'manual', 'correct', 'regularize', 'month', 'salary', 'signin']); assert.ok(P.POWERS.find(p => p.key === 'signin').off, '(13-11-2026) a sign-in for everybody at once: off until the Super Admin gives it');
+  const src = fs.readFileSync(path.join(root, 'public', 'mus.js'), 'utf8'), win = {}; new Function('window', 'document', src)(win, { getElementById: () => null });
+  assert.deepStrictEqual(win.HRMUS.pages.map(p => p[0]), ['muster', 'requests', 'rules', 'rface', 'rpowers']);      // (18-11-2026) the last three: parts of the Rule Book assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|\b(alert|confirm|prompt)\(/.test(src), 'only textContent, no browser dialog');
+  assert.deepStrictEqual(Object.keys(win.HRMUS._code), ['P', 'HD', 'A', 'WO', 'H', 'WOP', 'HP', 'IN', 'MIS', 'L']);
+});
+
+test('the site is chosen in HR among the Portal\'s sites of the person; the form has the employee\'s site; his page shows his attendance', () => {
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), js = fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'), api = fs.readFileSync(path.join(root, 'api', 'hr.js'), 'utf8');
+  for (const id of ['site_pick', 'f_site', 'd_att', 'd_att_lab']) assert.ok(html.indexOf('id="' + id + '"') > -1, '#' + id);
+  assert.match(html, /function sitePick\(me\) \{[\s\S]+?sel\.hidden = list\.length < 2;[\s\S]+?ticketFor\(code, false\)[\s\S]+?api\('api\/sso', \{ ticket: x\.j\.ticket \}\)[\s\S]+?location\.reload\(\);/, 'another site = a new ticket of the Portal, then the page again');
+  assert.ok(!/api\/(site|sites)\b/.test(html + js), 'HR makes no site – it only chooses');
+  assert.match(js, /site: \$\('f_site'\)\.value,/); assert.match(js, /fs\.disabled = !!e\.id && !isAdmin\(\);/); assert.match(js, /api\('empPage', \{ id: id \}\)/); assert.match(js, /aroundDraw\(id, r\.around\)/);      // (13-11-2026) his attendance comes with the one reading of his page
+  assert.match(api, /if \(sitesOf\(s\)\.indexOf\(site\) < 0\) throw fail\(403, 'Site: choose a site where you have HR\.', 'site'\);\n    if \(was && site !== was\.site\) needAdmin\(s\);/);
+});
+
+test('the attendance dashboard: the HR office only; it only reads; the page puts every text in as text; the muster\'s day opens in a panel', () => {
+  const act = fs.readFileSync(path.join(root, 'lib', 'act_dash.js'), 'utf8'), { ACT, SELF } = require('../api/hr');
+  assert.match(String(ACT.attDash), /^async attDash\(s\) \{\s+needOffice\(s\);/); assert.ok(SELF.indexOf('attDash') < 0, 'not for "My HR"');
+  assert.ok(!/db\('(POST|PATCH|PUT|DELETE)'/.test(act) && !/audit\(/.test(act), 'attDash writes nothing');
+  const src = fs.readFileSync(path.join(root, 'public', 'dash.js'), 'utf8'), win = {}; new Function('window', 'document', src)(win, { getElementById: () => null });
+  assert.deepStrictEqual(win.HRDASH.pages, [['dashboard', 'Dashboard']]); assert.ok(win.HRDASH.has('dashboard') && !win.HRDASH.has('muster'));
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|\b(alert|confirm|prompt)\(/.test(src), 'only textContent, no browser dialog');
+  assert.deepStrictEqual([win.HRDASH._initials('asha rig'), win.HRDASH._initials('Babu'), win.HRDASH._initials(''), win.HRDASH._minOf('09:15')], ['AR', 'B', '', 555]);
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), js = fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'), mus = fs.readFileSync(path.join(root, 'public', 'mus.js'), 'utf8');
+  for (const id of src.match(/\$\('([a-z_0-9]+)'\)/g).map(x => x.slice(3, -2))) assert.ok(html.indexOf('id="' + id + '"') > -1, 'the page has #' + id);
+  assert.ok(html.indexOf('<script src="dash.js"></script>') > -1 && html.indexOf('<script src="dash.js">') < html.indexOf('<script src="hr.js">'));
+  assert.match(js, /go\(page \|\| \(window\.HRDASH \? 'dashboard' : 'employees'\)\);/); assert.match(js, /if \(dash\) window\.HRDASH\.open\(S\.me, go\);/);
+  // the muster: the day's panel uses the same actions as before – a correction and a request's decision are the server's
+  for (const a of ["api('dayGet', { id: w.id, day: d })", "api('daySet', Object.assign({ id: w.id, day: d, reason: why.value }, body))", "api('regDecide', { id: q.id, decision: dec, note: note.value })"]) assert.ok(mus.indexOf(a) > -1, a);
+  assert.match(String(ACT.dayGet), /place: pl\[p\.place_id\] \|\| ''/);
+});
+
+test('the full profile (step 6): the checks of every kind of detail; nothing fixed – lists and what is compulsory; numbers masked; SQL only adds', () => {
+  const P = require('../lib/act_profile'), { ACT, SELF } = require('../api/hr'), L = { prefix: { 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa': { active: true }, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb': { active: false } } };
+  const g = P.GROUPS, A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  assert.deepStrictEqual(P.clean(g.secret.fields, { uan: '1234 5678 9012', bank_ifsc: 'sbin0001234', bank_account: '000123456789', pf_join: '01-04-2024', esic_no: '' }, {}, {}), { row: { uan: '123456789012', pf_join: '2024-04-01', bank_ifsc: 'SBIN0001234', bank_account: '000123456789' }, errors: [] });
+  assert.deepStrictEqual(P.clean(g.secret.fields, { uan: '123', bank_ifsc: 'SBIN1001234', bank_account: '12ab' }, {}, {}).errors, ['UAN number: 12 digits.', 'Bank IFSC code: 11 letters and digits, the fifth is 0 (for example SBIN0001234).', 'Bank account number: 6 to 18 digits.']);
+  assert.deepStrictEqual(P.clean(g.profile.fields, { prefix: A, official_email: 'A@B.co', cug: '+91 98765 43210', disability: '' }, L, {}).row, { prefix: A, official_email: 'a@b.co', cug: '9876543210' });
+  assert.deepStrictEqual(P.clean(g.profile.fields, { prefix: B }, L, {}).errors, ['Prefix: choose a value of the list.'], 'a value switched off is not offered');
+  assert.deepStrictEqual(P.clean(g.profile.fields, { prefix: B }, L, { prefix: B }).row, { prefix: B }, 'but it stays where it already is');
+  assert.deepStrictEqual(P.clean(g.job.fields, { notice_days: '30', retirement_age: '20', overtime: 'yes', probation_end: 'x' }, {}, {}), { row: { notice_days: 30, overtime: true }, errors: ['Probation ends on: a date as DD-MM-YYYY.', 'Retirement age (years): a whole number, 40 to 80.'] });
+  assert.deepStrictEqual(P.clean(P.ROWS.family.fields, { relation: '' }, {}, {}).errors, ['Name: needed.']);
+  const e = { dob: '1990-01-01', mobile: '9', email: '', gender: '', joined_on: '', department_id: null, designation_id: null }, c = P.complete(e, { data: { prefix: A }, secret: { uan: '1' } }, { family: [{}], education: [], experience: [], skill: [] }, ['emp.email', 'secret.uan', 'rows.education']);
+  assert.deepStrictEqual([c.filled, c.of, c.missing], [5, P.ITEMS.length, ['E-mail', 'Education (at least one)']]); assert.strictEqual(P.mask('000123456789'), 'XXXX6789');
+  for (const a of ['profGet', 'profSave', 'profRowSave', 'profRowRemove', 'listAll']) assert.match(String(ACT[a]), /needOffice\(s\)/, a); for (const a of ['listSave', 'profRequiredSave']) assert.match(String(ACT[a]), /needAdmin\(s\)/, a);
+  for (const a of Object.keys(P.ACT)) assert.ok(SELF.indexOf(a) < 0, a + ' is not for "My HR"');
+  const act = fs.readFileSync(path.join(root, 'lib', 'act_profile.js'), 'utf8'); assert.ok(!/db\('DELETE'/.test(act), 'nothing of the profile is deleted'); assert.match(act, /diff\[k\] = col === 'secret' \? 'changed'/, 'the audit never holds a number');
+  const q = fs.readFileSync(path.join(root, 'sql', 'hr_step6_profile.sql'), 'utf8').split('\n').filter(l => !/^\s*--/.test(l)).join('\n');
+  assert.ok(!/\b(drop|truncate|delete\s+from|alter\s+table\s+public\.\w+\s+(drop|rename))\b/i.test(q), 'step 6 only adds'); assert.ok(!/update\s+public\./i.test(q));
+  assert.match(q, /foreach t in array array\['hr_lists', 'hr_employee_profile', 'hr_employee_rows', 'hr_settings'\] loop\s+execute format\('alter table public\.%I enable row level security', t\);\s+execute format\('revoke all on public\.%I from public, anon, authenticated', t\);\s+execute format\('grant select, insert, update on public\.%I to service_role', t\);/);
+  const src = fs.readFileSync(path.join(root, 'public', 'prof.js'), 'utf8'), win = {}; new Function('window', 'document', src)(win, { getElementById: () => null });
+  assert.deepStrictEqual(win.HRPROF.pages, [['lists', 'Lists']]); assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|\b(alert|confirm|prompt)\(/.test(src), 'only textContent, no browser dialog');
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'); for (const id of src.match(/\$\('([a-z_0-9]+)'\)/g).map(x => x.slice(3, -2))) assert.ok(html.indexOf('id="' + id + '"') > -1, 'the page has #' + id);
+  assert.strictEqual(win.HRPROF._show({ type: 'list', list: 'prefix' }, 'x', { prefix: [{ id: 'x', name: 'Mr.' }] }), 'Mr.'); assert.strictEqual(win.HRPROF._show({ type: 'yesno' }, false, {}), 'No');
+});
+
+test('leave (step 7): the balance is walked day by day – monthly leaves, carry or lapse, an absent day takes one, an off day never; SQL only adds', () => {
+  const L = require('../lib/leave'), { ACT, SELF } = require('../api/hr'), d = rows => rows.map(x => ({ day: x[0], code: x[1] }));
+  const site = [{ id: 1, valid_from: '2026-11-01', per_month: 4, carry: true, auto_absent: true }];
+  // a road site: no weekly off – a Sunday absent takes a leave like any day; five absences, four leaves: the fifth stays absent
+  let w = L.walk(d([['2026-10-31', 'A'], ['2026-11-01', 'A'], ['2026-11-02', 'P'], ['2026-11-03', 'A'], ['2026-11-04', 'A'], ['2026-11-05', 'A'], ['2026-11-06', 'A']]), { policies: site, first: '2026-11-01' });
+  assert.deepStrictEqual([w.balance, Object.keys(w.marks), w.months['2026-11']], [0, ['2026-11-01', '2026-11-03', '2026-11-04', '2026-11-05'], { credit: 4, added: 0, used: 4 }]);
+  // the Head Office: its Sunday is a weekly off – an approved leave over it takes nothing for that day; a day he came after all: nothing
+  w = L.walk(d([['2026-11-07', 'A'], ['2026-11-08', 'WO'], ['2026-11-09', 'A'], ['2026-11-10', 'P'], ['2026-11-11', 'HD']]), { policies: [{ valid_from: '2026-11-01', per_month: 2, carry: true, auto_absent: false }], first: '2026-11-01', leave: { '2026-11-08': 1, '2026-11-09': 1, '2026-11-10': 1, '2026-11-11': 0.5 } });
+  assert.deepStrictEqual([w.balance, w.marks], [0.5, { '2026-11-09': { days: 1, auto: false }, '2026-11-11': { days: 0.5, auto: false } }], 'auto_absent off: the absent 7th takes nothing');
+  // unused leaves go on – or lapse; what the HR office added counts on its day; a new version from its date
+  const two = d([['2026-11-30', 'P'], ['2026-12-01', 'P']]);
+  assert.strictEqual(L.walk(two, { policies: site, first: '2026-11-01', adjust: { '2026-11-30': 1.5 } }).balance, 9.5);
+  assert.strictEqual(L.walk(two, { policies: [{ valid_from: '2026-11-01', per_month: 4, carry: false, auto_absent: true }], first: '2026-11-01', adjust: { '2026-11-30': 1.5 } }).balance, 4);
+  assert.strictEqual(L.walk(two, { policies: site.concat([{ id: 2, valid_from: '2026-12-01', per_month: 1, carry: true, auto_absent: true }]), first: '2026-11-01' }).balance, 5);
+  assert.strictEqual(L.walk(two, { policies: site, first: '2026-12-01' }).balance, 4, 'a person who joined in December gets nothing of November');
+  assert.strictEqual(L.walk(two, { policies: [], first: '2026-11-01' }).balance, 0);
+  assert.deepStrictEqual(L.policy({ per_month: '4', carry: false }).row, { per_month: 4, carry: false, auto_absent: true, levels: 2 }); assert.deepStrictEqual(L.policy({ per_month: 'x', levels: 3 }).errors, ['Leaves a month: 0 to 31 (halves allowed).', 'Who approves: 1 or 2 levels.']);
+  for (const a of ['leaveList', 'leaveBalances', 'leavePolicy']) assert.match(String(ACT[a]), /needOffice\(s\)/, a);
+  for (const [a, p] of [['leaveDecide', 'regularize'], ['leaveAdjust', 'regularize'], ['leavePolicySave', 'shifts']]) assert.ok(String(ACT[a]).indexOf("await power.need(s, '" + p + "')") > -1, a);
+  for (const a of ['myLeave', 'leaveAsk', 'leaveCancel', 'teamLeaves', 'teamLeaveDecide']) { assert.ok(SELF.indexOf(a) > -1, a); assert.match(String(ACT[a]), /await me\(s\)/, a + ': only for the employee the sign-in is'); }
+  const act = fs.readFileSync(path.join(root, 'lib', 'act_leave.js'), 'utf8'); assert.ok(!/db\('DELETE'/.test(act)); assert.ok(!/db\('PATCH', 'hr_leave_(policy|adjust)/.test(act), 'a policy and an adjustment are only added');
+  const q = fs.readFileSync(path.join(root, 'sql', 'hr_step7_leave.sql'), 'utf8').split('\n').filter(l => !/^\s*--/.test(l)).join('\n');
+  assert.ok(!/\b(drop|truncate|delete\s+from|alter\s+table\s+public\.\w+\s+(drop|rename))\b/i.test(q) && !/update\s+public\./i.test(q), 'step 7 only adds');
+  const lj = fs.readFileSync(path.join(root, 'public', 'leave.js'), 'utf8'), lw = {}; new Function('window', 'document', lj)(lw, { getElementById: () => null }); assert.deepStrictEqual(lw.HRLEAVE.pages, [['leave', 'Leave']]);
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|\b(alert|confirm|prompt)\(/.test(lj), 'only textContent, no browser dialog');
+  assert.match(q, /grant select, insert on public\.hr_leave_policy, public\.hr_leave_adjust to service_role;/); assert.match(q, /grant select, insert, update on public\.hr_leave_requests to service_role;/);
+});
+
+test('(the app\'s "Me") a person\'s own record and papers: always the employee the sign-in is, never an id from the phone; numbers masked; he removes nothing', () => {
+  const { ACT, SELF } = require('../api/hr'), src = fs.readFileSync(path.join(root, 'lib', 'act_self.js'), 'utf8');
+  for (const a of ['myHr', 'myDocs', 'myDocUploadUrl', 'myDocAdd', 'myDocLink']) { assert.ok(SELF.indexOf(a) > -1, a); assert.match(String(ACT[a]), /const emp = await me\(s\)/, a); assert.ok(!/x\.id\b/.test(String(ACT[a])), a + ': no employee id is taken from the phone'); }
+  assert.match(String(ACT.myDocUploadUrl), /Object\.assign\(\{\}, x, \{ id: emp\.id \}\)/); assert.match(String(ACT.myDocAdd), /Object\.assign\(\{\}, x, \{ id: emp\.id \}\)/);
+  assert.match(String(ACT.myDocLink), /&employee_id=eq\.' \+ emp\.id/, 'only a paper of his own');
+  assert.ok(!/docRemove|DELETE|PATCH|POST/.test(src), 'nothing is removed or changed here – a paper is attached through the office\'s own action');
+  assert.match(src, /const MASKED = \['pf_no', 'uan', 'esic_no', 'bank_account'\];/); assert.match(src, /secret && MASKED\.indexOf\(d\.key\) > -1 \? P\.mask\(v\) : String\(v\)/);
+  assert.ok(SELF.indexOf('docRemove') < 0 && SELF.indexOf('docList') < 0 && SELF.indexOf('profGet') < 0);
+});
+
+test('an employee\'s sign-in is asked of the Portal from the page; HR\'s server keeps no password; only the Admin sees the button', () => {
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), js = fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8');
+  for (const id of ['d_login', 'dlg_login', 'lg_title', 'lg_email', 'lg_mobile', 'lg_done', 'lg_pw', 'lg_err', 'lg_go', 'b_signin', 'dlg_signin', 'sg_go', 'sg_res']) assert.ok(html.indexOf('id="' + id + '"') > -1, '#' + id);
+  assert.match(html, /window\.HRPORTAL = function \(path, body\) \{[\s\S]+?fetch\(PORTAL \+ '\/' \+ path, \{ method: 'POST', credentials: 'same-origin', headers: \{ 'Content-Type': 'application\/json', 'X-RCL': '1' \}/);
+  assert.match(js, /\$\('d_login'\)\.hidden = left \|\| !isAdmin\(\);/); assert.match(js, /window\.HRPORTAL\('api\/hrlogin', \{ site: e\.site, email: e\.email \|\| '', mobile: e\.mobile \|\| '', name: e\.name, known: e\.portal_email \|\| '' \}\)/, '(13-11-2026) his e-mail, his mobile number, or both');
+  assert.match(js, /\$\('b_signin'\)\.hidden = !S\.init\.signin;/, 'everybody at once: only who the server says'); assert.match(js, /window\.HRPORTAL\('api\/hrlogin', \{ site: site, people: part\.map\(/);
+  assert.match(js, /if \(b\.dataset\.close === 'dlg_login'\) \{ \$\('lg_pw'\)\.textContent = ''; \$\('lg_done'\)\.hidden = true; \}/, 'the one-time password leaves the page with its box');
+  assert.ok(!/localStorage|sessionStorage/.test(js.slice(js.indexOf('function loginGive'), js.indexOf('// ---------- add / change'))), 'kept nowhere');
+  for (const f of fs.readdirSync(path.join(root, 'api')).concat(fs.readdirSync(path.join(root, 'lib')).map(x => '../lib/' + x))) assert.ok(!/password/i.test(fs.readFileSync(path.join(root, 'api', f), 'utf8').replace(/No secret, key, password[^\n]*/g, '')), f + ': HR\'s server has nothing to do with passwords');
+});
+
+test('an employee\'s page opens at once from the list; nothing of him is changed before the server\'s own answer; the readings of one action are asked together', () => {
+  const js = fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'), api = fs.readFileSync(path.join(root, 'api', 'hr.js'), 'utf8');
+  assert.match(js, /else if \(had\) \{ drawEmp\(\{ employee: had, history: \[\], boss: null \}, false\); show\('dlg_emp'\); \}/);
+  assert.match(js, /if \(seq !== S\.seq \|\| \(\(had \|\| mem\) && \$\('dlg_emp'\)\.hidden\)\) return;/, 'closed or another opened meanwhile: the late answer is dropped');
+  assert.match(js, /\['d_prof', 'd_kyc', 'd_docs', 'd_login', 'd_facebtn', 'd_salary', 'd_del', 'd_exit', 'd_tr', 'd_edit'\]\.forEach\(function \(b\) \{ \$\(b\)\.disabled = !full; \}\);/);
+  assert.ok(!/localStorage|sessionStorage/.test(js.slice(js.indexOf('function openEmp'), js.indexOf('function login()'))), 'kept in the page\'s memory only');
+  for (const a of ['empList', 'empGet', 'privGet']) { const i = api.indexOf('async ' + a + '('); assert.match(api.slice(i, i + 1400), /await Promise\.all\(\[db\('GET'/, a); }
+});
+
+test('(13-11-2026) the rules in words – for the attendance PDF: one line for each rule that is set, none for one that is not', () => {
+  const D = require('../lib/day');
+  assert.deepStrictEqual(D.ruleNotes({}, null), []); assert.deepStrictEqual(D.ruleNotes(null, null), []);
+  assert.deepStrictEqual(D.ruleNotes({ full_hours: 9, half_hours: 4.5, grace_min: 15, half_after_min: 120, late_free: 3, late_to_half: 3, early_min: 30, once: true, week_off: [0], face: true }, { start_time: '08:30', end_time: '17:30', auto_out: '23:50' }), [
+    'Full day: 9 working hours or more.', 'Half day: 4.5 working hours or more, but fewer than 9. Fewer than 4.5 hours: absent.', 'Late: IN more than 15 minutes after the shift starts.',
+    'IN 120 minutes or more after the shift starts: the day counts as a half day.', 'The first 3 late days of a month are only marked; every late day after them counts as a half day.',
+    'Every 3 late days of a month take half a day from the days for pay.', 'Early leaving: OUT more than 30 minutes before the shift ends.', 'One IN and one OUT a day.',
+    'OUT not marked: the day is closed by itself at 23:50 and counts as absent.', 'Weekly off: Sunday.', 'Attendance is marked only with the registered face.']);
+  assert.deepStrictEqual(D.ruleNotes({ full_hours: 8 }, { start_time: '08:30', end_time: '17:30' }), ['Full day: 8 working hours or more.', 'Fewer than 8 working hours: half day.']);
+});
+
+test('(12-11-2026) once a day; a forgotten OUT closed at the shift\'s own time = absent; 3 late days only marked, then a half day; very late = a half day; a night shift', () => {
+  const D = require('../lib/day'), T = (day, hm) => D.at(day, hm), day = '2026-11-10', next = '2026-11-11', dayS = { start_time: '08:30', end_time: '18:00', auto_out: '23:50' }, night = { start_time: '20:00', end_time: '06:00', auto_out: '11:50' };
+  // the rules as typed
+  assert.deepStrictEqual(D.rules({ once: 'yes', late_free: 3, half_after_min: 120, grace_min: 0 }).rules, { grace_min: 0, late_free: 3, half_after_min: 120, once: true });
+  assert.match(D.rules({ grace_min: 30, half_after_min: 30 }).errors.join(), /more than the grace/); assert.deepStrictEqual(D.rules({}).rules, {}, 'nothing typed = nothing applied');
+  assert.strictEqual(D.shift({ name: 'Day', start_time: '08:30', end_time: '18:00', auto_out: '23:50' }).row.auto_out, '23:50'); assert.match(D.shift({ name: 'Day', start_time: '08:30', end_time: '18:00', auto_out: '25:00' }).errors.join(), /Closed by itself/);
+  // closed by itself: the day shift the same night, the night shift the next morning
+  assert.strictEqual(D.autoOutAt(dayS, day), T(day, '23:50')); assert.strictEqual(D.autoOutAt(night, day), T(next, '11:50')); assert.strictEqual(D.autoOutAt({ start_time: '08:30', end_time: '18:00' }, day), null);
+  const st = (x) => D.status(Object.assign({ day: day, today: next, in: T(day, '08:20'), out: null, holiday: '', rules: {}, shift: dayS }, x));
+  assert.deepStrictEqual([st({ now: T(day, '23:49'), today: day }).code, st({ now: T(day, '23:50'), today: day }).code, st({ now: T(day, '23:50'), today: day }).auto], ['IN', 'A', true]);
+  assert.deepStrictEqual([st({ now: T(next, '09:00'), shift: night, in: T(day, '20:05') }).code, st({ now: T(next, '11:50'), shift: night, in: T(day, '20:05') }).code], ['MIS', 'A'], 'a night shift is still open the next morning');
+  assert.strictEqual(st({ now: T(next, '09:00'), shift: { start_time: '08:30', end_time: '18:00' } }).code, 'MIS', 'no closing time: as before');
+  assert.strictEqual(st({ now: T(next, '09:00'), out: T(day, '18:05') }).code, 'P', 'with its OUT nothing is closed');
+  assert.strictEqual(st({ now: T(next, '09:00'), in: T(day, '23:55') }).code, 'MIS', 'an IN after the closing time is not closed by it');
+  // very late = a half day at once
+  const late = D.status({ day: day, today: next, now: T(next, '09:00'), in: T(day, '10:45'), out: T(day, '19:00'), holiday: '', rules: { grace_min: 0, half_after_min: 120 }, shift: dayS });
+  assert.deepStrictEqual([late.code, late.late_half, late.late_min], ['HD', true, 135]);
+  assert.strictEqual(D.status({ day: day, today: next, now: T(next, '09:00'), in: T(day, '09:00'), out: T(day, '19:00'), holiday: '', rules: { grace_min: 0, half_after_min: 120 }, shift: dayS }).code, 'P');
+  // the late days of a month: the first 3 only marked, the 4th and later a half day; a new month starts again; an absent day is not a late day
+  const mk = list => list.map(x => ({ day: x[0], code: x[1], late_min: x[2] })), got = D.lateHalves(mk([['2026-11-02', 'P', 5], ['2026-11-03', 'P', 0], ['2026-11-04', 'P', 9], ['2026-11-05', 'A', 0], ['2026-11-06', 'P', 1], ['2026-11-07', 'P', 2], ['2026-11-09', 'HD', 3], ['2026-11-10', 'P', 4], ['2026-12-01', 'P', 7]]), () => ({ late_free: 3 }));
+  assert.deepStrictEqual(got.map(d => d.code), ['P', 'P', 'P', 'A', 'P', 'HD', 'HD', 'HD', 'P']); assert.deepStrictEqual(got.filter(d => d.late_half).map(d => d.day), ['2026-11-07', '2026-11-10']);
+  assert.deepStrictEqual(D.lateHalves(mk([['2026-11-02', 'P', 5], ['2026-11-03', 'P', 5]]), () => ({})).map(d => d.code), ['P', 'P'], 'no such rule: late days are only marked');
+  assert.deepStrictEqual(D.lateHalves(mk([['2026-11-02', 'P', 5]]), () => ({ late_free: 0 })).map(d => d.code), ['HD'], '0 allowed: the first late day is a half day');
+  // where his day stands: once a day; the OUT of a night shift the morning after; closed by itself
+  const P = (kind, d, hm) => ({ kind: kind, day: d, at: new Date(T(d, hm)).toISOString() }), on = sh => () => sh, S = (list, now, r, sh) => { const x = D.stand(list, now, next, r, on(sh)); return [x.next, x.open ? x.open.day : '', x.closed ? 1 : 0, x.shown.length]; };
+  assert.deepStrictEqual(S([], T(next, '08:00'), { once: true }, dayS), ['in', '', 0, 0]);
+  assert.deepStrictEqual(S([P('in', next, '08:20')], T(next, '12:00'), { once: true }, dayS), ['out', next, 0, 1]);
+  assert.deepStrictEqual(S([P('in', next, '08:20'), P('out', next, '18:00')], T(next, '18:05'), { once: true }, dayS), ['done', '', 0, 2], 'once a day: no second IN');
+  assert.deepStrictEqual(S([P('in', next, '08:20'), P('out', next, '18:00')], T(next, '18:05'), {}, dayS), ['in', '', 0, 2], 'without the rule: as before');
+  assert.deepStrictEqual(S([P('in', next, '08:20')], T(next, '23:51'), { once: true }, dayS), ['done', '', 1, 1], 'closed by itself: nothing more today');
+  assert.deepStrictEqual(S([P('in', day, '20:05')], T(next, '06:10'), { once: true }, night), ['out', day, 0, 1], 'the night shift\'s OUT the morning after');
+  assert.deepStrictEqual(S([P('in', day, '20:05'), P('out', next, '06:10')], T(next, '19:55'), { once: true }, night), ['in', '', 0, 1], 'and its IN the same evening');
+  assert.deepStrictEqual(S([P('in', day, '20:05')], T(next, '12:00'), { once: true }, night), ['in', '', 0, 0], 'yesterday\'s night was closed by itself: today starts new');
+  assert.deepStrictEqual(S([P('in', day, '08:20')], T(next, '08:00'), {}, { start_time: '08:30', end_time: '18:00' }), ['in', '', 0, 0], 'no closing time: yesterday\'s IN is open for 20 hours only');
+  const src = fs.readFileSync(path.join(root, 'lib', 'act_attend.js'), 'utf8');
+  assert.match(src, /if \(kind === 'in' && st\.next === 'done'\) throw fail\(409, 'Today\\'s attendance is done – one IN and one OUT a day\./); assert.ok(!/PATCH', 'hr_punches|DELETE', 'hr_punches/.test(src), 'a punch is never changed or deleted – a closed day is only read so');
+});
+
+test('(step 9) the face: the percentage from the model\'s distance, the site\'s rule, the nearest registered picture; no punch without the check; only himself; nothing deleted', () => {
+  const F = require('../lib/face'), D = require('../lib/day');
+  assert.deepStrictEqual([0, 0.3, 0.45, 0.5, 0.6, 0.7, 1].map(F.pct), [100, 99, 90, 81, 50, 19, 0], '0.45 reads 90 %, the model\'s own line 0.6 reads 50 %');
+  assert.ok(Math.abs(F.distOf(90) - 0.45) < 1e-9); assert.ok(F.pct(F.distOf(80)) === 80 && F.distOf(80) > F.distOf(90), 'a lower percentage allows a wider distance');
+  assert.deepStrictEqual([F.minOf({}), F.minOf({ face_min: 85 }), F.minOf({ face_min: 10 }), F.minOf(null)], [90, 85, 90, 90], '90 unless the site set its own');
+  const a = new Array(128).fill(0), b = a.slice(); b[0] = 0.3; const c = a.slice(); c[0] = 0.8;
+  assert.deepStrictEqual(F.nearest([c, b], a), { distance: 0.3, pct: 99 }, 'the nearest of the registered pictures counts'); assert.deepStrictEqual(F.nearest([], a), { distance: Infinity, pct: 0 });
+  assert.deepStrictEqual(D.rules({ face: 'yes', face_min: 90 }).rules, { face_min: 90, face: true }); assert.match(D.rules({ face_min: 30 }).errors.join(), /Face: at least/); assert.deepStrictEqual(D.rules({ face: '' }).rules, {}, 'not asked unless switched on');
+  const att = fs.readFileSync(path.join(root, 'lib', 'act_attend.js'), 'utf8'), face = fs.readFileSync(path.join(root, 'api', 'face.js'), 'utf8'), FA = require('../api/face');
+  assert.match(att, /if \(st\.face\) \{\s+let seen; try \{ seen = \(await db\('GET', 'hr_face_tries\?select=id&employee_id=eq\.' \+ emp\.id \+ '&client_id=eq\.' \+ cid \+ '&kind=eq\.punch&result=eq\.ok&limit=1'\)\)/, 'this punch\'s own photo must have been found his');
+  assert.ok(att.indexOf('if (st.face) {') < att.indexOf("await db('POST', 'hr_punches'"), 'checked before anything is saved');
+  assert.deepStrictEqual(FA.SELF, ['faceState', 'faceConsentText', 'faceEnrolUrls', 'faceEnrol', 'faceCheck']); assert.ok(!/db\(/.test(String(FA.ACT.faceConsentText)), 'the consent words: nothing is read or kept');
+  for (const k of FA.SELF.filter(k => k !== 'faceConsentText')) { assert.match(String(FA.ACT[k]), /const emp = await me\(s\)/, k); assert.ok(!/x\.id\b/.test(String(FA.ACT[k])), k + ': no employee id from the phone'); }
+  assert.match(String(FA.ACT.faceInfo), /needOffice\(s\)/); assert.match(String(FA.ACT.faceReset), /if \(!isAdmin\(s\)\) throw fail\(403/);
+  assert.ok(!/'DELETE'/.test(face), 'a face is reset, never deleted'); assert.match(face, /if \(s\.role === 'self' && SELF\.indexOf\(String\(x\.action\)\) < 0\) throw fail\(403/);
+  const v = JSON.parse(fs.readFileSync(path.join(root, 'vercel.json'), 'utf8')); assert.ok(v.functions['api/face.js'].includeFiles.indexOf('face-api/model') > -1, 'the model goes with the endpoint');
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step9_faces.sql'), 'utf8'); assert.ok(!/drop table|delete from|truncate/i.test(sql.replace(/^--.*$/gm, '')), 'the step deletes nothing'); assert.match(sql, /grant select, insert on public\.hr_face_tries to service_role;/);
+});
+
+test('(step 10) the month: the counts of a person; verified = still the same; who may do what; an approved month is closed everywhere a day is changed; the step only adds', () => {
+  const M = require('../lib/month'), MO = require('../lib/act_month'), root = path.join(__dirname, '..');
+  const days = ['P', 'P', 'HD', 'A', 'L', 'WO', 'H', 'WOP', 'HP', 'MIS', '', 'P'].map((c, i) => ({ code: c, late_min: i === 1 || i === 2 ? 12 : 0 }));
+  const c = M.counts(days, { paid: 6.04 });
+  assert.deepStrictEqual(c, { present: 3, half: 1, absent: 1, leave: 1, week_off: 1, holiday: 1, extra: 2, late: 2, open: 1, paid: 6 });
+  assert.strictEqual(M.same(c, Object.assign({}, c)), true); assert.strictEqual(M.same(c, Object.assign({}, c, { extra: 1 })), false); assert.strictEqual(M.same(null, c), false);
+  assert.deepStrictEqual([M.lastDay('2026-02'), M.lastDay('2028-02'), M.lastDay('2026-10'), M.monthOk('2026-13'), M.monthOk('2026-11')], ['2026-02-28', '2028-02-29', '2026-10-31', false, true]);
+  const A = MO.ACT;
+  assert.match(String(A.monthVerify), /await power\.need\(s, 'month'\)/); assert.match(String(A.monthVerify), /await needOpen\(s\.site, month \+ '-01'\)/);
+  for (const k of ['monthReturn', 'monthApprove', 'monthSites']) assert.match(String(A[k]), /needOffice\(s\); await needHo\(s\)/, k);
+  for (const k of ['monthReopen', 'hoList', 'hoSet']) assert.match(String(A[k]), /if \(s\.role !== 'super'\) throw fail\(403/, k);
+  assert.match(String(A.monthList), /^async monthList\(s, x\) \{\s+needOffice\(s\)/);
+  const src = f => fs.readFileSync(path.join(root, 'lib', f), 'utf8');
+  assert.ok(!/'DELETE'/.test(src('act_month.js')), 'nothing is deleted'); assert.ok(!/hr_punches|hr_day_entries'/.test(src('act_month.js').replace(/\/\*[\s\S]*?\*\//g, '')), 'attendance itself is not written here');
+  // closed: a day set by hand, a request asked and approved, a doubtful punch decided, a leave decided
+  assert.strictEqual((src('act_muster.js').match(/require\('\.\/act_month'\)\.needOpen\(/g) || []).length, 3); assert.match(src('act_attend.js'), /needOpen\(s\.site, R\.today\(Date\.parse\(p\.at\)\)\)/); assert.match(src('act_leave.js'), /needOpen\(s\.site, q\.from_day\)/);
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step10_month.sql'), 'utf8').replace(/^--.*$/gm, '');
+  assert.ok(!/drop |delete from|truncate|alter table public\.hr_(?!ho_hr|month)/i.test(sql), 'the step only adds its own three tables'); assert.match(sql, /unique \(site, month, employee_id\)/); assert.match(sql, /enable row level security/);
+  assert.match(sql, /grant select, insert, update on public\.hr_ho_hr, public\.hr_month_people, public\.hr_months to service_role;/);
+  const page = fs.readFileSync(path.join(root, 'public', 'month.js'), 'utf8'); assert.ok(!/innerHTML|insertAdjacentHTML|document\.write/.test(page), 'a person\'s text only as text');
+  assert.match(fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), /<section id="p_month" hidden><\/section>[\s\S]*<script src="month\.js"><\/script>/);
+});
+
+test('(step 11) a salary: the amount as typed; the one that counts on a day; never for an HR User or "My HR"; the step only adds', () => {
+  const P = require('../lib/act_pay'), root = path.join(__dirname, '..');
+  assert.deepStrictEqual(['18000', '18,000.50', '₹ 700', '0', '-1', '1.234', '', 'x', '9999999', '10000000'].map(P.amountOf), [18000, 18000.5, 700, null, null, null, null, null, 9999999, null]);
+  const rows = [{ id: 1, status: 'approved', valid_from: '2026-01-01' }, { id: 2, status: 'approved', valid_from: '2026-06-01' }, { id: 3, status: 'pending', valid_from: '2026-07-01' }, { id: 4, status: 'returned', valid_from: '2026-02-01' }, { id: 5, status: 'approved', valid_from: '2026-06-01' }];
+  assert.deepStrictEqual(['2025-12-31', '2026-03-01', '2026-06-01', '2026-12-01'].map(d => (P.current(rows, d) || {}).id), [undefined, 1, 5, 5]);
+  assert.match(String(P.ACT.salaryAsk), /await power\.need\(s, 'salary'\)/); assert.match(String(P.ACT.salaryGet), /await maySee\(s\)/);
+  for (const k of ['salaryWaiting', 'salaryDecide']) assert.match(String(P.ACT[k]), /needOffice\(s\); if \(!\(await isHo\(s\)\)\) throw fail\(403/, k);
+  const H = require('../api/hr'); for (const k of Object.keys(P.ACT)) assert.ok(H.SELF.indexOf(k) < 0, k + ' is not for "My HR"');
+  const src = fs.readFileSync(path.join(root, 'lib', 'act_pay.js'), 'utf8'); assert.ok(!/'DELETE'/.test(src)); assert.ok(!/audit\([^;]*amount/.test(src), 'the amount is not written into the audit');
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step11_salary.sql'), 'utf8').replace(/^--.*$/gm, '');
+  assert.ok(!/drop |delete from|truncate|alter table public\.hr_(?!salaries)/i.test(sql)); assert.match(sql, /enable row level security/); assert.match(sql, /grant select, insert, update on public\.hr_salaries to service_role;/); assert.match(sql, /where status = 'pending'/);
+  const page = fs.readFileSync(path.join(root, 'public', 'pay.js'), 'utf8'); assert.ok(!/innerHTML|insertAdjacentHTML|document\.write/.test(page));
+  assert.match(fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), /id="d_salary"[^>]*hidden>Salary…<\/button>[\s\S]*<script src="pay\.js"><\/script>/);
+});
+
+test('(step 12) the pay of a person: a month\'s salary ÷ the days of the month, a day\'s rate, an extra day = one day\'s pay; PF / ESIC / PT only when ticked and set; the advance never more than what is left; no number of a law in the code', () => {
+  const P = require('../lib/pay'), root = path.join(__dirname, '..');
+  const c = { present: 20, half: 2, absent: 3, leave: 1, week_off: 4, holiday: 1, extra: 2, late: 0, open: 0, paid: 29 };
+  // a month's salary: 31 000 in a month of 31 days = 1 000 a day
+  let s = P.slip({ salary: { pay_type: 'monthly', amount: 31000 }, counts: c, month_days: 31, flags: {}, settings: {}, adjust: {} });
+  assert.deepStrictEqual([s.day, s.pay_days, s.earned, s.extra, s.gross, s.pf, s.esic, s.pt, s.advance, s.net, s.problem], [1000, 29, 29000, 2000, 31000, 0, 0, 0, 0, 31000, '']);
+  assert.strictEqual(P.slip({ salary: { pay_type: 'monthly', amount: 30000 }, counts: c, month_days: 30, flags: {}, settings: {} }).earned, 29000, 'the days of THAT month');
+  // a day's rate: the days worked, half days as a half, leave; no pay for a weekly off not worked
+  s = P.slip({ salary: { pay_type: 'daily', amount: 600 }, counts: c, month_days: 31, flags: {}, settings: {} });
+  assert.deepStrictEqual([s.pay_days, s.earned, s.extra, s.net], [22, 13200, 1200, 14400]);
+  // the settings: only when ticked AND set
+  const set = { pf_pct: 12, pf_cap: 15000, esic_pct: 0.75, esic_limit: 21000, pt_slabs: [{ from: 7500, amount: 175 }, { from: 10000, amount: 200 }] };
+  s = P.slip({ salary: { pay_type: 'monthly', amount: 31000 }, counts: c, month_days: 31, flags: { pf: true, esic: true, pt: true }, settings: set, adjust: { other_earn: 500, other_ded: 100 }, advance: { id: 1, left: 3000, monthly: 2000 } });
+  assert.deepStrictEqual([s.gross, s.pf, s.esic, s.pt, s.advance, s.other_ded, s.deductions, s.net], [31500, 1800, 0, 200, 2000, 100, 4100, 27400], 'PF on the cap; no ESIC above the limit; the highest slab reached');
+  assert.deepStrictEqual([P.slip({ salary: { pay_type: 'monthly', amount: 31000 }, counts: c, month_days: 31, flags: { pf: true, esic: true, pt: true }, settings: {} }).deductions, P.slip({ salary: { pay_type: 'monthly', amount: 31000 }, counts: c, month_days: 31, flags: {}, settings: set }).deductions], [0, 0]);
+  s = P.slip({ salary: { pay_type: 'daily', amount: 500 }, counts: { present: 1 }, month_days: 30, flags: { esic: true, pt: true }, settings: set }); assert.deepStrictEqual([s.esic, s.pt, s.net], [4, 0, 496], 'ESIC rounded up; below the first slab no tax');
+  // the advance: what is left, what he said for this month, never more than the pay
+  const adv = a => P.slip({ salary: { pay_type: 'daily', amount: 500 }, counts: { present: 2 }, month_days: 30, flags: {}, settings: {}, adjust: a.adjust, advance: a.advance }).advance;
+  assert.deepStrictEqual([adv({ advance: { left: 300, monthly: 2000 } }), adv({ advance: { left: 5000, monthly: 2000 } }), adv({ advance: { left: 5000, monthly: 2000 }, adjust: { advance: 0 } }), adv({ advance: { left: 5000, monthly: 2000 }, adjust: { advance: 250 } }), adv({})], [300, 1000, 0, 250, 0]);
+  assert.match(P.slip({ salary: null, counts: c, month_days: 31 }).problem, /No approved salary/);
+  assert.match(P.slip({ salary: { pay_type: 'daily', amount: 100 }, counts: { present: 1 }, month_days: 30, adjust: { other_ded: 500 } }).problem, /deductions are more than the pay/);
+  assert.deepStrictEqual(P.totals([{ gross: 10, net: 8, pf: 2 }, { gross: 5.5, net: 5 }]).gross, 15.5);
+  // the settings as typed
+  assert.deepStrictEqual(P.settings({ pf_pct: '12', pf_cap: '15,000', esic_pct: '', pt_slabs: [{ from: '10000', amount: '200' }, { from: '7500', amount: '175' }, { from: '', amount: '' }] }), { errors: [], settings: { pf_pct: 12, pf_cap: 15000, pt_slabs: [{ from: 7500, amount: 175 }, { from: 10000, amount: 200 }] } });
+  assert.strictEqual(P.settings({ pf_pct: '120' }).errors.length, 1); assert.strictEqual(P.settings({ pt_slabs: [{ from: 'x', amount: '1' }] }).errors.length, 1); assert.strictEqual(P.settings({ pt_slabs: [{ from: '1', amount: '1' }, { from: '1', amount: '2' }] }).errors.length, 1);
+  const code = fs.readFileSync(path.join(root, 'lib', 'pay.js'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  assert.ok(!/\b(0\.75|3\.25|15000|21000|200|175|2500)\b/.test(code), 'no rate, limit or slab of a law is written into the code');
+  const R = require('../lib/act_payroll'); for (const k of Object.keys(R.ACT)) if (k !== 'mySlips') assert.match(String(R.ACT[k]), /await needHo\(s\)/, k + ': the HO HR only');
+  assert.match(String(R.ACT.mySlips), /const emp = await me\(s\)/); assert.ok(!/x\b/.test(String(R.ACT.mySlips).split('{')[0].replace('mySlips(s)', '')), 'nothing is taken from the phone');
+  const src = fs.readFileSync(path.join(root, 'lib', 'act_payroll.js'), 'utf8'); assert.ok(!/'DELETE'/.test(src)); assert.ok(!/'PATCH', 'hr_pay(slips|_runs)/.test(src), 'a locked month is never changed');
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step12_payroll.sql'), 'utf8').replace(/^--.*$/gm, '');
+  assert.ok(!/drop |delete from|truncate|alter table public\.hr_(?!pay_|advances)/i.test(sql)); assert.match(sql, /grant select, insert on public\.hr_pay_settings, public\.hr_pay_runs, public\.hr_payslips to service_role;/); assert.match(sql, /unique \(site, month\)/); assert.match(sql, /security invoker/);
+  const M = require('../api/menu'); assert.deepStrictEqual([M.mayOpen('ho', 'super'), M.mayOpen('ho', 'admin'), M.mayOpen('ho', 'user', true), M.mayOpen('ho', 'self', true)], [true, false, true, false]);
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write/.test(fs.readFileSync(path.join(root, 'public', 'payroll.js'), 'utf8')));
+});
+
+test('(what comes up) a paper\'s date within 30 days or run out; a birthday and the years at work – also 29 February; who may take the bank list', () => {
+  const C = require('../lib/coming'), root = path.join(__dirname, '..');
+  assert.deepStrictEqual([C.paper('2026-12-12', '2026-11-12', 30), C.paper('2026-12-13', '2026-11-12', 30), C.paper('2026-11-12', '2026-11-12', 30), C.paper('2026-11-01', '2026-11-12', 30), C.paper('', '2026-11-12', 30), C.paper('x', '2026-11-12', 30)], [{ left: 30 }, null, { left: 0 }, { left: -11 }, null, null]);
+  assert.deepStrictEqual(C.yearly('1990-11-12', '2026-11-12', 7), { in: 0, years: 36, day: '2026-11-12' }); assert.deepStrictEqual(C.yearly('1990-11-19', '2026-11-12', 7), { in: 7, years: 36, day: '2026-11-19' });
+  assert.strictEqual(C.yearly('1990-11-20', '2026-11-12', 7), null); assert.strictEqual(C.yearly('1990-11-11', '2026-11-12', 7), null, 'yesterday\'s is next year');
+  assert.deepStrictEqual(C.yearly('1990-01-02', '2026-12-30', 7), { in: 3, years: 37, day: '2027-01-02' }, 'over the year\'s end');
+  assert.deepStrictEqual(C.yearly('1992-02-29', '2026-02-27', 7), { in: 1, years: 34, day: '2026-02-28' }); assert.deepStrictEqual(C.yearly('1992-02-29', '2028-02-27', 7), { in: 2, years: 36, day: '2028-02-29' });
+  assert.strictEqual(C.yearly('2026-11-12', '2026-11-12', 7), null, 'the day he joined is not a year yet'); assert.strictEqual(C.yearly('', '2026-11-12', 7), null);
+  const M = require('../lib/act_more');
+  for (const k of ['paySlipOf', 'payBank']) assert.match(String(M.ACT[k]), /await needHo\(s\)/, k + ': the HO HR only'); assert.match(String(M.ACT.hrComing), /needOffice\(s\)/);
+  assert.match(String(M.ACT.payBank), /await audit\(s\.site, s\.email, 'Bank list taken'/); assert.ok(!/audit\([^;]*(account|ifsc)/.test(String(M.ACT.payBank)), 'no number in the audit');
+  const H = require('../api/hr'); for (const k of Object.keys(M.ACT)) assert.ok(H.SELF.indexOf(k) < 0, k + ' is not for "My HR"');
+  const s = M.slipView('2026-10', 1260, { pay_type: 'monthly', rate: 31000, month_days: 31, pay_days: 2, extra_days: 0, earned: 2000, extra: 0, other_earn: 100, adjust: { earn_note: 'arrear' }, gross: 2100, pf: 240, esic: 0, pt: 200, advance: 400, other_ded: 0, deductions: 840 });
+  assert.deepStrictEqual([s.net, s.earnings.map(l => l.label + ' ' + l.amount), s.deductions.map(l => l.label + ' ' + l.amount), s.total_deductions], [1260, ['Earned pay 2000', 'arrear 100'], ['PF 240', 'Profession Tax 200', 'Advance 400'], 840]);
+  for (const f of ['payroll.js', 'dash.js']) assert.ok(!/innerHTML|insertAdjacentHTML|document\.write/.test(fs.readFileSync(path.join(root, 'public', f), 'utf8')), f + ': a person\'s text only as text');
+});
+
+test('(13-11-2026) the employee sheet: the company\'s 29 columns as they are, then ours; no Category column; headings found whatever their case; a company\'s sheet read as it is', () => {
+  const SH = require('../lib/act_sheet'), P = require('../lib/act_profile'), heads = SH.COLS.map(c => c.head);
+  assert.deepStrictEqual(heads.slice(0, 29), ['Name of Company', 'Branch Name', 'Current Project Name', 'UAN No.', 'Employee Name', 'Employee Code', 'Auto Monthly CTC', 'Date of Joining', 'Employee Status', 'Employee Retained', 'Sign In', 'Sign Out', 'PAN', 'Deduct PF',
+    'Probation Period In Days', 'ESIC Contribution Rate', 'Deduct ESIC', 'ESIC Type', 'ESIC Deduction Rate', 'Deduct PT', 'TDS Type', 'Attach', 'Basic', 'Check Time', 'Annual Bonus', 'Deduct Income Tax', 'Annual Medical Reimbursement', 'Annual LTA', 'Totals']);
+  for (const h of ['Mobile', 'E-mail', 'Date of Birth', 'Designation', 'Department', 'Aadhaar', 'Bank', 'Bank IFSC Code', 'Bank Account Number', 'Name as on Bank', 'PF Number', 'ESIC Number', 'Family Mobile', 'Current Address']) assert.ok(heads.indexOf(h) > 28, h);
+  assert.ok(heads.indexOf('Category') === -1, 'no Category column in the sheet'); assert.strictEqual(new Set(heads).size, heads.length, 'no heading twice');
+  const out = SH.colsOut(), names = [].concat(...out.map(c => c.names)); assert.strictEqual(new Set(names).size, names.length, 'a heading belongs to one column');
+  assert.ok(out.find(c => c.key === 'category').old, 'a file of before with a Category column is still read');
+  assert.deepStrictEqual(out.filter(c => c.fill).map(c => c.key), ['company', 'branch'], 'the company and the branch stand once for a group of rows – carried down');
+  // every detail of the profile, the statutory & bank and the pay details has its column
+  for (const g of Object.keys(P.GROUPS)) for (const d of P.GROUPS[g].fields) assert.ok(SH.COLS.some(c => c.kind === 'prof' && c.group === g && c.field === d.key), g + '.' + d.key);
+  assert.deepStrictEqual([SH.yn('Yes'), SH.yn('no'), SH.yn('Y'), SH.yn(true), SH.yn('0'), SH.yn('maybe')], [true, false, true, true, false, null]);
+  // the page: the company's sheet – merged cells (company / branch once), text numbers, a total's row
+  const src = fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'), win = {}; new Function('window', 'document', src)(win, { getElementById: () => null });
+  const m = win.HR._mapRows([['Name of Company', 'Branch Name', 'Current Project Name', 'UAN No.', 'Employee Name', 'Employee Code', 'Auto Monthly CTC', 'Date of Joining', 'Deduct PF', 'Totals'],
+    ['Test Company Limited', 'Branch One', 'Site A', '', 'Person One', 'RCL101', '25000', '2024-04-01 00:00:00', 'Yes', '1'], ['', '', 'Site A', '', 'Person Two', 'M007', '0', '2025-01-15 00:00:00', 'No', '1'],
+    ['', 'Branch Two', 'Site B', '', 'Person Three', '123', '18000', '2026-02-01 00:00:00', '', '1'], ['', '', '', '', '', '', '', '', '', '3']], out);
+  assert.deepStrictEqual(m.rows.map(r => [r._line, r.company, r.branch, r.project, r.code, r.ctc, r.pf]), [[2, 'Test Company Limited', 'Branch One', 'Site A', 'RCL101', '25000', 'Yes'], [3, 'Test Company Limited', 'Branch One', 'Site A', 'M007', '0', 'No'], [4, 'Test Company Limited', 'Branch Two', 'Site B', '123', '18000', '']]);
+  assert.ok(m.hasProject && !m.unknown.length);
+  // the pay details: the Admin's only; the new kinds of detail are checked
+  assert.ok(P.GROUPS.pay.adminOnly && P.GROUPS.pay.secret); assert.ok(P.ADMIN_KEYS.indexOf('ctc_monthly') > -1 && P.ADMIN_KEYS.indexOf('uan') === -1);
+  const c = P.clean(P.GROUPS.pay.fields.concat(P.GROUPS.job.fields), { ctc_monthly: '25,000.50', basic: '-5', deduct_income_tax: false, sign_in: '9:05:00', sign_out: '25:00', probation_days: '180' }, {}, {});
+  assert.deepStrictEqual(c.row, { ctc_monthly: 25000.5, deduct_income_tax: false, sign_in: '09:05', probation_days: 180 }); assert.match(c.errors.join(' '), /Basic: a number, 0 or more.*Sign out \(time\): a time as HH:MM\./);
+});
+
+test('the new look (13-11-2026): the menu on the left with every page as before, and Ctrl K – it opens only what the person has; every text as text', () => {
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), js = fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'), src = fs.readFileSync(path.join(root, 'public', 'find.js'), 'utf8'), dash = fs.readFileSync(path.join(root, 'public', 'dash.js'), 'utf8');
+  // the frame: the menu, the search, the site – and the page's ids the scripts use
+  assert.match(html, /<aside class="sd" id="side">[\s\S]*<nav id="tabs"[\s\S]*<div class="mn">[\s\S]*id="find_open"[\s\S]*id="site_pick"[\s\S]*id="who2"[\s\S]*<section id="p_emp">/);
+  assert.match(html, /<script src="find\.js"><\/script>/); for (const id of src.match(/\$\('([a-z_0-9]+)'\)/g).map(x => x.slice(3, -2))) assert.ok(html.indexOf('id="' + id + '"') > -1, 'the page has #' + id);
+  // every page of before has its group; the pages a person may not open are not in the menu – nor in the search (the same list)
+  const G = new Function('return ' + /var GROUP = (\{[^}]+\})/.exec(js)[1])();
+  assert.deepStrictEqual(Object.keys(G).sort(), ['ai', 'approvals', 'attendance', 'cpolicies', 'departments', 'employees', 'joining', 'leave', 'lists', 'month', 'muster', 'notices', 'papers', 'payroll', 'phones', 'places', 'reports', 'requests', 'rulebook', 'rules']);      // (Phase 6) the reports      // (step 15) joining, papers to verify, company policies      // (step 13) the Rule Book
+  assert.match(js, /\.filter\(function \(p\) \{ return p\[2\] && pageOk\(p\[0\]\); \}\);/);      // (19-11-2026) and an HR User's pages assert.match(js, /pages: function \(\) \{ return S\.init \? pages\(\) : \[\]; \}/);
+  // Ctrl K: the words typed must all be there; what starts with them comes first; an employee is asked from the server's own list
+  const win = {}; new Function('window', 'document', 'navigator', src)(win, { getElementById: () => null, readyState: 'complete' }, {});
+  const m = win.HRFIND._match; assert.deepStrictEqual([m('Payroll Leave & pay', 'pay'), m('Month verification', 'ver mon'), m('Muster', 'pay'), m('Add employee new person join', 'new')], [2, 1, 0, 1]);
+  assert.strictEqual(win.HRFIND._norm('  Shifts   &  RULES '), 'shifts & rules');
+  assert.match(src, /action: 'empList', q: q, status: '', category: ''/); assert.match(src, /if \(n !== F\.seq\) return;/); assert.match(src, /var b = \$\(a\[2\]\); return b && !b\.hidden/);
+  for (const s of [src, dash]) assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|\b(alert|confirm|prompt)\(/.test(s), 'only textContent, no browser dialog');
+  { const rp = fs.readFileSync(path.join(root, 'public', 'reports.js'), 'utf8'); assert.ok(!/innerHTML|insertAdjacentHTML|document\.write|\b(alert|confirm|prompt)\(/.test(rp), '(Phase 6) the reports: only text');
+    assert.deepStrictEqual([...new Set([...rp.matchAll(/api\('([a-zA-Z]+)'/g)].map(x => x[1]))].sort(), ['repCatalog', 'repRun'], 'the reports only read'); }
+  // the dashboard asks nothing new: the same one reading action
+  assert.deepStrictEqual([...new Set([...dash.matchAll(/api\('([a-zA-Z]+)'/g)].map(x => x[1]))].sort(), ['attDash', 'punchSelfie']); assert.match(dash, /action: 'hrComing'/);
+});
+
+test('the new look, the rest (13-11-2026): the counts of the pages are counted from what the page has; the Sign-in column only asks the Portal to read; switches; the map beside the list', () => {
+  const rd = f => fs.readFileSync(path.join(root, 'public', f), 'utf8'), html = rd('index.html'), js = rd('hr.js'), att = rd('att.js'), lv = rd('leave.js'), roll = rd('payroll.js'), mus = rd('mus.js'), dash = rd('dash.js'), act = fs.readFileSync(path.join(root, 'lib', 'act_dash.js'), 'utf8');
+  // the dashboard: leave and absent of today come with attDash – inside "none"; still only reading
+  assert.match(act, /leave: 0, absent: 0, absent_yesterday: 0/); assert.match(act, /d\.code === 'L' \? 'leave' : d\.code === 'A' \|\| d\.code === 'MIS' \? 'absent' : ''/); assert.ok(!/db\('(POST|PATCH|PUT|DELETE)'/.test(act));
+  assert.match(dash, /open = Math\.max\(0, c\.none - lv - ab\)/); assert.match(dash, /cards: cards,/);
+  // no page asks the server anything new for its cards
+  for (const [name, src, actions] of [['att.js', att, ['punchDay', 'devList']], ['leave.js', lv, ['leaveList']], ['payroll.js', roll, ['payList']]]) { assert.match(src, /window\.HRDASH\.cards\(/, name); for (const a of actions) assert.match(src, new RegExp("api\\('" + a + "'"), name + ' ' + a); }
+  // the Sign-in column: the Portal's "check" (read only), the admins only, hidden until it answers; the e-mail, the number and the kept ID – nothing else is sent
+  assert.match(html, /<th id="th_signin" hidden>Sign-in<\/th><th>Status<\/th>/);
+  assert.match(js, /if \(!isAdmin\(\) \|\| !window\.HRPORTAL\) return;/); assert.match(js, /window\.HRPORTAL\('api\/hrlogin', \{ site: S\.init\.site, check: ask\.map\(function \(e\) \{ return \{ email: e\.email \|\| '', mobile: e\.mobile \|\| '', known: e\.portal_email \|\| '' \}; \}\) \}\)/);
+  assert.match(js, /r\.signins\.length !== ask\.length\) return;/);
+  // the HR Admin's powers: the same checkbox and the same action, shown as a switch
+  assert.match(mus, /el\('label', 'ck sw'\), cb = inp\('checkbox'\); cb\.setAttribute\('role', 'switch'\);[^\n]*api\('powerSet', \{ power: p\.key, allowed: cb\.checked \}\)/);
+  // Work places: one map of the places of the list; a place on the map opens the same form as its row
+  assert.match(att, /split\.appendChild\(t\.box\); split\.appendChild\(mb\); root\.appendChild\(split\); allMap\(mb, rows\);/); assert.match(att, /l\.on\('click', function \(\) \{ place\(o\); \}\)/);
+  for (const s of [att, lv, roll, js]) assert.ok(!/innerHTML|insertAdjacentHTML|document\.write/.test(s));
+});
+
+test('an employee is ONE full page (13-11-2026): his head, Overview and the tabs of his full profile in it; no window on a window; the same actions as before', () => {
+  const rd = f => fs.readFileSync(path.join(root, 'public', f), 'utf8'), html = rd('index.html'), js = rd('hr.js'), prof = rd('prof.js');
+  assert.match(html, /<div class="dlg pg" id="dlg_emp" hidden>[\s\S]*class="ep-back" type="button" data-close="dlg_emp"[\s\S]*id="d_tabs"[\s\S]*<div id="d_over">[\s\S]*id="d_todo_body"[\s\S]*<div id="d_pbody" hidden><\/div>/);
+  assert.match(html, /<div class="dlg pg" id="dlg_form" hidden>/); assert.match(html, /body\.in \.dlg\.pg\{display:block;background:#F3F6FC/);
+  for (const id of ['d_edit', 'd_tr', 'd_login', 'd_salary', 'd_facebtn', 'd_exit', 'd_del', 'd_kyc', 'd_docs', 'd_prof']) assert.strictEqual(html.split('id="' + id + '"').length, 2, 'one button #' + id);
+  // the profile is drawn INTO the page (the same actions of the server); the window of before still works without `into`
+  assert.match(prof, /function profile\(id, done, into\) \{/); assert.match(prof, /if \(into\) all\.unshift\(\{ key: 'overview', name: 'Overview' \}\);/); assert.match(prof, /if \(into && into\.live && !into\.live\(\)\) return;/);
+  assert.deepStrictEqual([...new Set([...prof.matchAll(/api\('(prof[A-Za-z]+)'/g)].map(x => x[1]))].sort(), ['profGet', 'profRequiredSave', 'profRowRemove', 'profRowSave', 'profSave']);
+  assert.match(js, /S\.prof = window\.HRPROF\.profile\(id, null, \{ tabs: \$\('d_tabs'\), body: \$\('d_pbody'\)/);
+  // a window closed without saving goes back to his page; a change saved too; another page of the menu leaves it
+  assert.match(js, /function back\(d\) \{ if \(\{ dlg_form: 1, dlg_tr: 1, dlg_exit: 1, dlg_del: 1 \}\[d\] && S\.open && S\.open\.employee/); assert.match(js, /\['dlg_emp', 'dlg_form'\]\.forEach\(function \(d\) \{ if \(\$\(d\) && !\$\(d\)\.hidden\) hide\(d\); \}\);/);
+  assert.match(js, /if \(\$\('f_id'\)\.value && !\(r\.site && r\.site !== S\.me\.site\)\) openEmp\(\$\('f_id'\)\.value\);/);
+  assert.ok(!/innerHTML|insertAdjacentHTML|document\.write/.test(prof));
+});
+
+test('a save is seen at once (13-11-2026): "Saving…" on the button, a window when the server HAS saved, nothing said saved on an error; the saved tab is answered without a second reading', () => {
+  const prof = fs.readFileSync(path.join(root, 'public', 'prof.js'), 'utf8'), js = fs.readFileSync(path.join(root, 'public', 'hr.js'), 'utf8'), act = fs.readFileSync(path.join(root, 'lib', 'act_profile.js'), 'utf8');
+  assert.match(prof, /function saving\(b, run\) \{ var was = b\.textContent; b\.disabled = true; b\.textContent = 'Saving…';/);
+  assert.match(prof, /api\('profSave', \{ id: e\.id, group: cur\.key, data: f\.get\(\) \}\)\.then\(function \(n\) \{ draw\(n\); saved\(n\.bank && n\.bank\.waiting \? 'Sent for approval' : 'Saved', [^;]+\); \}, function \(x\) \{ back\(\); err\(x\); \}\);/, '(step 14) a bank change is said "Sent for approval", never "Saved"');
+  assert.match(prof, /api\('profRowSave', [^\n]{0,120}?\.then\(function \(n\) \{ draw\(n\); saved\('Saved', [^}]+\}, function \(x\) \{ back\(\); err\(x\); \}\);/);
+  assert.match(prof, /s\.setAttribute\('role', 'alertdialog'\)/); assert.match(js, /window\.HRPROF\.saved\('Saved', r\.code/);
+  assert.match(act, /L\.p = Object\.assign\(\{\}, L\.p, \{ \[col\]: next \}\); return Object\.assign\(out\(s, L\), \{ bank: asked, bank_wait: await B\.waitingOf\(s, L\.e\.id\) \}\);/, 'the profile is not read again (only what waits of the bank, step 14)');
+});
+
+test('13-11-2026: the two masters on one page with delete and the usual list; an employee\'s page in one reading; "Not available"; the sign in / out times only in the sheet', () => {
+  const rd = f => fs.readFileSync(path.join(root, f), 'utf8'), js = rd('public/hr.js'), prof = rd('public/prof.js'), html = rd('public/index.html'), lib = rd('lib/act_masters.js'), api = rd('api/hr.js');
+  const M = require('../lib/act_masters'), P = require('../lib/act_profile'), { ACT } = require('../api/hr');
+  // masters: delete only what nobody has (employees AND their history are asked), written down; the list only adds
+  const del = String(ACT.masterDelete), seed = String(ACT.masterSeed);
+  assert.match(del, /H\.needAdmin\(s\)/); assert.match(del, /'hr_employees\?select=id&' \+ COL\[x\.kind\][\s\S]*'hr_employment\?select=id&' \+ COL\[x\.kind\][\s\S]*if \(n \|\| h\) throw fail\(409,[\s\S]*await db\('DELETE', t \+ '\?id=eq\.' \+ id[\s\S]*await audit\(/);
+  assert.match(seed, /H\.needAdmin\(s\)/); assert.ok(!/db\('(PATCH|DELETE|PUT)'/.test(seed), 'the list only adds'); assert.strictEqual((lib.match(/db\('DELETE'/g) || []).length, 1);
+  assert.ok(M.there(['account', 'highway'], 'Accounts') && M.there(['hr'], 'HR') && !M.there(['hr'], 'Highway') && !M.there(['account'], 'Administration'));
+  assert.ok(M.DEPARTMENTS.length >= 15 && Object.keys(M.DESIGNATIONS).join() === 'staff,operator,driver,labour'); const all = [].concat(...Object.values(M.DESIGNATIONS)); assert.strictEqual(new Set(all.map(M.low)).size, all.length, 'no designation twice');
+  assert.match(js, /\[\['departments', 'Departments & designations', isAdmin\(\)\]\]/); assert.match(js, /if \(page === 'designations'\) page = 'departments';/); assert.match(html, /<section id="p_mast" hidden><div id="m_two"><\/div><\/section>/);
+  assert.match(js, /if \(M\.del !== key\) \{ M\.del = key;/, 'Delete is pressed twice');
+  // an employee's page: one reading; a part the person may not see comes back empty; nothing is written
+  const pg = String(ACT.empPage); assert.match(pg, /const emp = await H\.ACT\.empGet\(s, \{ id: x\.id \}\);/); assert.match(pg, /Promise\.all\(\[part\('empAround'\), part\('privGet'\), part\('profGet'\)\]\)/); assert.ok(!/db\(/.test(pg));
+  assert.match(js, /\(S\.pages \|\| \(S\.pages = \{\}\)\)\[id\] = \{ at: Date\.now\(\), r: r \};/); assert.ok(!/localStorage|sessionStorage/.test(js.slice(js.indexOf('function openEmp'), js.indexOf('function profIn'))));
+  // "Not available": only a name, a number or a date; it counts as filled; never for an amount, Yes / No, a time or a list
+  const F = [{ key: 'cug', label: 'CUG', type: 'digits', min: 10, max: 10 }, { key: 'ifsc', label: 'IFSC', type: 'ifsc' }, { key: 'd', label: 'D', type: 'date' }, { key: 'amt', label: 'Amt', type: 'num' }, { key: 'yn', label: 'YN', type: 'yesno' }, { key: 'must', label: 'Must', type: 'text', need: true }];
+  let c = P.clean(F, { cug: 'na', ifsc: 'Not Available', d: 'N/A', amt: 'NA', yn: 'NA', must: 'NA' }, {}, {}); assert.deepStrictEqual(c.row, { cug: 'NA', ifsc: 'NA', d: 'NA', must: 'NA' }); assert.strictEqual(c.errors.length, 2, c.errors.join(' | '));
+  assert.ok(P.isNa(' n.a. ') && !P.isNa('Nagpur') && !P.isNa('')); assert.match(prof, /return \{ box: w, get: function \(\) \{ return nc\.checked \? 'NA' : i\.value; \} \};/);
+  // the sign in / out times: in the Excel sheet as before; not on the page, not in the count, and a save of the Job tab leaves them alone
+  assert.deepStrictEqual(P.GROUPS.job.fields.filter(d => d.sheet).map(d => d.key), ['sign_in', 'sign_out']); assert.ok(!P.ITEMS.some(i => /sign_(in|out)/.test(i.key))); assert.deepStrictEqual(P.seen(P.GROUPS.job.fields).filter(d => /sign_/.test(d.key)), []);
+  assert.match(rd('lib/act_profile.js'), /const keys = seen\(GROUPS\[g\]\.fields\)\.map\(d => d\.key\)/); assert.match(rd('lib/act_sheet.js'), /pf\('sign_in', 'Sign In', 'job'\), pf\('sign_out', 'Sign Out', 'job'\)/);
+});
+
+test('(13-11-2026) HR opened by itself has the way back to the Portal and Log out; inside Mechanical\'s screen they are not shown', () => {
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8');
+  assert.match(html, /id="go_portal" type="button"[^>]*hidden>‹ Portal<\/button><button class="top-b out" id="log_out" type="button"[^>]*hidden>Log out<\/button>/); assert.match(html, /\.embed \.top-b\{display:none\}/);
+  assert.match(html, /gp\.hidden = lo\.hidden = EMBED \|\| !PORTAL;/); assert.match(html, /gp\.onclick = function \(\) \{ location\.href = PORTAL \+ '\/'; \};/);
+  // Log out: HR's sign-in first, then the Portal's own logout, then the Portal's page – whatever answers
+  assert.match(html, /api\('api\/logout', \{\}\)\.catch\(function \(\) \{[^}]*\}\)\.then\(portalOut\)\.then\(away, away\);/); assert.match(html, /fetch\(PORTAL \+ '\/api\/auth', \{ method: 'POST', credentials: 'same-origin', headers: \{ 'Content-Type': 'application\/json', 'X-RCL': '1' \}, body: JSON\.stringify\(\{ action: 'logout' \}\) \}\)/);
+});
+
+test('(13-11-2026) one look wherever HR is opened from: shown by the ERP it takes the whole window – never while the ERP only loads it ahead, out of sight; "‹ ERP" goes back', () => {
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8');
+  assert.match(html, /var shown = function \(\) \{ try \{ return !!FE && !FE\.hidden && FE\.getClientRects\(\)\.length > 0; \} catch \(e\) \{ return false; \} \};/);
+  assert.match(html, /if \(shown\(\)\) takeWindow\(\); else if \(FE\) var WT = setInterval\(function \(\) \{ if \(shown\(\)\) \{ clearInterval\(WT\); takeWindow\(\); \} \}, 250\);/);
+  assert.match(html, /window\.top\.location\.assign\(BASE \+ \(location\.hash \|\| ''\)\); OUT = true;/, 'the site, the page and the person go along; Back returns to the ERP');
+  assert.match(html, /if \(!OUT\) start\(\);/); assert.match(html, /id="go_erp" type="button"[^>]*hidden>‹ ERP<\/button>/);
+  assert.match(html, /main = \/\\\/hr\\\/\$\/\.test\(BASE\) \? BASE\.replace\(\/hr\\\/\$\/, ''\) : ''; if \(ge\) \{ ge\.hidden = EMBED \|\| !main;/);
+});
+
+test('(13-11-2026) the RCL look: the logo\'s red in balance, the white menu with the logo, the three lines open and close it, a page picked closes it', () => {
+  const rd = f => fs.readFileSync(path.join(root, 'public', f), 'utf8'), html = rd('index.html'), js = rd('hr.js'), dash = rd('dash.js');
+  // the logo: the company's own picture (the same as the ERP's), the mark kept here when it cannot be loaded
+  assert.match(html, /<img class="sd-logo" id="sd_logo" src="https:\/\/i\.ibb\.co\/CpSfBqXX\/RCL-LOGO-PDF\.png" alt="Rachana Construction Limited">/); assert.match(html, /lg\.onerror = function \(\) \{ lg\.onerror = null; lg\.src = 'rcl-mark\.png'; lg\.classList\.add\('mark'\); \};/);
+  assert.ok(fs.statSync(path.join(root, 'public', 'rcl-mark.png')).size > 2000);
+  // the three lines; a page picked closes the menu; a narrow screen starts closed; motion is not forced on who asked for less
+  assert.match(html, /<button class="nav-tog" id="nav_tog" type="button" aria-label="Menu" aria-controls="side" aria-expanded="true"><i><\/i><i><\/i><i><\/i><\/button>/);
+  assert.match(html, /tg\.onclick = function \(\) \{ set\(!isOpen\(\)\); \};/); assert.match(html, /if \(!wide\(\)\) document\.body\.classList\.add\('nav-off'\);/); assert.match(js, /b\.onclick = function \(\) \{ go\(p\[0\]\); if \(window\.HRNAV\) window\.HRNAV\.picked\(\); \};/);
+  assert.match(html, /@media\(prefers-reduced-motion:reduce\)\{html:not\(\.embed\) body\.in #app,html:not\(\.embed\) \.sd,/);
+  // the menu of the picture: the same pages, their groups, a sign for each
+  const G = new Function('return ' + /var GROUP = (\{[^}]+\})/.exec(js)[1])(), R = new Function('return ' + /var RANK = (\[[^\]]+\])/.exec(js)[1])(), I = new Function('return ' + /var ICON = (\{[\s\S]*?\});\n/.exec(js)[1])();
+  assert.deepStrictEqual([...new Set(Object.values(G))], ['HR Management', 'Organization', 'Payroll']); for (const k of R) assert.ok(I[k], 'a sign for ' + k); for (const k of Object.keys(G)) assert.ok(R.indexOf(k) > -1, k + ' has its place');
+  // red in balance: no blue of before is left in the page's styles; the dashboard still asks nothing new
+  const css = html.slice(html.indexOf('<style>'), html.indexOf('</style>')); for (const c of ['#1E63E9', '#1570EF', '#1857D0']) assert.ok(css.indexOf(c) === -1, c);
+  assert.deepStrictEqual([...new Set([...dash.matchAll(/api\('([a-zA-Z]+)'/g)].map(x => x[1]))].sort(), ['attDash', 'punchSelfie']); assert.match(dash, /function hello\(now\)/);
+});
+
+/* ───────────── step 13 (13-11-2026): THE RULE BOOK – lib/rulebook.js, pure ───────────── */
+test('rule book: what each kind of policy may say – only what is filled is kept, a wrong number is refused', () => {
+  const B = require('../lib/rulebook');
+  assert.deepStrictEqual(B.KINDS, ['attendance', 'late', 'weekoff', 'leave', 'compoff', 'overtime']);
+  assert.deepStrictEqual(B.body('attendance', { full_hours: '8', half_hours: 4, once: 'yes' }), { body: { full_hours: 8, half_hours: 4, once: true }, errors: [] });
+  assert.strictEqual(B.body('attendance', { full_hours: 4, half_hours: 4 }).errors.length, 1);
+  assert.deepStrictEqual(B.body('late', {}).body, {}, 'nothing filled = nothing applied');
+  assert.deepStrictEqual(B.body('late', { grace_min: 15, early_min: 15, free: 3, half_after_min: 120, half_before_min: 120 }).errors, []);
+  assert.strictEqual(B.body('late', { grace_min: 30, half_after_min: 20 }).errors.length, 1);
+  // a weekly off: Sunday, and the 2nd and 4th Saturday; all five Saturdays = every Saturday
+  assert.deepStrictEqual(B.body('weekoff', { days: [0], nth: { 6: [4, 2, 2] } }).body, { days: [0], nth: { 6: [2, 4] } });
+  assert.deepStrictEqual(B.body('weekoff', { days: [0], nth: { 6: [1, 2, 3, 4, 5] } }).body, { days: [0, 6] });
+  assert.deepStrictEqual(B.body('weekoff', {}).body, { days: [] }, 'a road site: no weekly off');
+  // leave: earned by the month (Head Office) or by a Sunday worked (a site)
+  assert.deepStrictEqual(B.body('leave', { earn: 'sunday', per_month: 4 }).body, { earn: 'sunday', per_month: 4, carry: true, auto_absent: false });
+  assert.deepStrictEqual(B.body('leave', { earn: 'month', per_month: 1, carry: true, exit: 'pay', exit_max: 30 }).body, { earn: 'month', per_month: 1, carry: true, auto_absent: false, exit: 'pay', exit_max: 30 });
+  assert.ok(B.body('leave', { per_month: 1 }).errors.length && B.body('leave', { earn: 'sunday', per_month: 1.5 }).errors.length && B.body('leave', { earn: 'month' }).errors.length);
+  assert.deepStrictEqual(B.body('compoff', { result: 'leave' }).body, { result: 'leave', full_shift: true });
+  assert.deepStrictEqual(B.body('overtime', { after_min: 30, round_min: 30, result: 'pay', rate: 1 }).body, { after_min: 30, round_min: 30, result: 'pay', rate: 1 });
+  assert.ok(B.body('overtime', {}).errors.length && B.body('nothing', {}).errors.length);
+});
+
+test('rule book: who verifies and who approves – by role or by name with a stand-in; verify may be left out; the steps of a request', () => {
+  const B = require('../lib/rulebook');
+  const a = B.auth({ verify: [{ role: 'site_hr' }], approve: [{ role: 'ho_hr' }, { email: 'Boss@X.test', stand_in: 'second@x.test' }] });
+  assert.deepStrictEqual(a, { auth: { verify: [{ role: 'site_hr' }], approve: [{ role: 'ho_hr' }, { email: 'boss@x.test', stand_in: 'second@x.test' }] }, errors: [] });
+  assert.ok(B.auth({ verify: [{ role: 'site_hr' }] }).errors.length, 'somebody must approve');
+  assert.ok(B.auth({ approve: [{ role: 'king' }] }).errors.length && B.auth({ approve: [{ email: 'not a mail' }] }).errors.length);
+  assert.strictEqual(B.firstStage(a.auth), 'verify'); assert.strictEqual(B.firstStage({ verify: [], approve: [{ role: 'ho_hr' }] }), 'approve');
+  const siteHr = { email: 'hr@site.test', roles: { site_hr: true } }, hoHr = { email: 'ho@x.test', roles: { ho_hr: true } }, sub = { email: 'second@x.test', roles: {} }, sup = { email: 's@x.test', roles: { super: true } };
+  assert.ok(B.mayDo(a.auth.verify, siteHr) && !B.mayDo(a.auth.approve, siteHr) && B.mayDo(a.auth.approve, hoHr) && B.mayDo(a.auth.approve, sub) && B.mayDo([], sup));
+  assert.ok(B.mayDo([{ role: 'reporting' }], { email: 'b@x.test', roles: {}, reports: true }) && !B.mayDo([{ role: 'reporting' }], { email: 'b@x.test', roles: {} }));
+  let ask = { status: 'pending', stage: 'verify', auth: a.auth, steps: [] };
+  assert.ok(B.decide(ask, true, hoHr, 'T1').error, 'the HO HR cannot verify what waits for the site HR');
+  const v = B.decide(ask, true, siteHr, 'T1'); assert.deepStrictEqual([v.status, v.stage, v.done, v.steps.length], ['pending', 'approve', false, 1]);
+  ask = Object.assign({}, ask, v); assert.ok(B.decide(ask, true, siteHr, 'T2').error);
+  const ok = B.decide(ask, true, hoHr, 'T2'); assert.deepStrictEqual([ok.status, ok.done, ok.steps.length, ok.steps[1].by], ['approved', true, 2, 'ho@x.test']);
+  assert.strictEqual(B.decide(ask, false, hoHr, 'T2').status, 'refused'); assert.ok(B.decide(Object.assign({}, ask, ok), true, sup, 'T3').error, 'decided once');
+});
+
+test('rule book: a person has his own policy from a date, else his site\'s, else none; a day is measured with the version of that day', () => {
+  const B = require('../lib/rulebook');
+  const versions = { 1: [{ id: 10, valid_from: '2026-01-01', body: { grace_min: 15 } }, { id: 11, valid_from: '2026-12-01', body: { grace_min: 10 } }], 2: [{ id: 20, valid_from: '2026-06-01', body: { grace_min: 5 } }] };
+  const site = [{ id: 1, policy_id: 1, valid_from: '2026-01-01' }];
+  assert.strictEqual(B.policyOn({ assign: [], defaults: [], versions: versions }, '2026-11-13'), null, 'no policy of the Rule Book: the rules of before');
+  assert.deepStrictEqual(B.policyOn({ assign: [], defaults: site, versions: versions }, '2026-11-13'), { policy_id: 1, from: 'site', body: { grace_min: 15 }, auth: {}, version_id: 10 });
+  assert.strictEqual(B.policyOn({ assign: [], defaults: site, versions: versions }, '2026-12-05').body.grace_min, 10, 'the new version counts from its date – the days before keep the old one');
+  const own = [{ id: 5, policy_id: 2, valid_from: '2026-11-10' }];
+  assert.strictEqual(B.policyOn({ assign: own, defaults: site, versions: versions }, '2026-11-09').from, 'site'); assert.deepStrictEqual([B.policyOn({ assign: own, defaults: site, versions: versions }, '2026-11-10').from, B.policyOn({ assign: own, defaults: site, versions: versions }, '2026-11-10').body.grace_min], ['person', 5]);
+  // taken back from a date: an empty row = the site's own again
+  assert.strictEqual(B.policyOn({ assign: own.concat([{ id: 6, policy_id: null, valid_from: '2026-11-20' }]), defaults: site, versions: versions }, '2026-11-21').from, 'site');
+  assert.strictEqual(B.policyOn({ assign: [{ id: 7, policy_id: 2, valid_from: '2026-03-01' }], defaults: [], versions: versions }, '2026-03-02'), null, 'the policy says nothing before its first version');
+});
+
+test('rule book: weekly off – the 2nd and 4th Saturday, the HR office\'s word on a fifth Saturday; the rules of a day from the policies', () => {
+  const B = require('../lib/rulebook');
+  const ho = { days: [0], nth: { 6: [2, 4] } };      // November 2026: Saturdays 7, 14, 21, 28; Sundays 1, 8, 15, 22, 29
+  assert.deepStrictEqual(['2026-11-07', '2026-11-14', '2026-11-21', '2026-11-28', '2026-11-15', '2026-11-16'].map(d => B.isOff(ho, d)), [false, true, false, true, true, false]);
+  assert.strictEqual(B.nthOf('2026-10-31'), 5); assert.strictEqual(B.isOff({ days: [0], nth: { 6: [5] } }, '2026-10-31'), true);
+  assert.strictEqual(B.isOff({ days: [0], nth: { 6: [5] } }, '2026-10-31', false), false, 'the HR office said: this fifth Saturday is a working day');
+  assert.strictEqual(B.isOff({ days: [] }, '2026-11-15'), false, 'a road site works on a Sunday');
+  const siteRules = { full_hours: 8, grace_min: 30, late_free: 5, week_off: [0], face: true };
+  assert.deepStrictEqual(B.dayRules(siteRules, null, '2026-11-15'), siteRules, 'no policy: the site\'s own rules, untouched');
+  const r = B.dayRules(siteRules, { late: { grace_min: 15, free: 3, half_before_min: 120 }, weekoff: { days: [] } }, '2026-11-15');
+  assert.deepStrictEqual(r, { full_hours: 8, face: true, grace_min: 15, half_before_min: 120, late_free: 3, early_counts: true, week_off: [] });
+  assert.deepStrictEqual(B.dayRules(siteRules, { weekoff: ho }, '2026-11-14').week_off, [6]); assert.deepStrictEqual(B.dayRules(siteRules, null, '2026-11-15', false).week_off, []);
+});
+
+test('rule book: overtime in steps, overtime as leave, comp-off for a whole shift, a bulk correction only in the person\'s favour', () => {
+  const B = require('../lib/rulebook');
+  const ot = { after_min: 30, round_min: 30 }, end = Date.parse('2026-11-13T12:30:00Z');
+  assert.deepStrictEqual([10, 29, 30, 50, 70, 125].map(m => B.overtimeMin(ot, end + m * 60000, end)), [0, 0, 30, 30, 60, 120]);
+  assert.strictEqual(B.overtimeMin(null, end + 3600000, end), 0); assert.strictEqual(B.overtimeMin(ot, null, end), 0);
+  assert.deepStrictEqual([B.overtimeDays(540, 9), B.overtimeDays(270, 9), B.overtimeDays(200, 9), B.overtimeDays(60, 0)], [1, 0.5, 0, 0]);
+  const co = { result: 'leave', full_shift: true };
+  assert.deepStrictEqual([B.compoffDays(co, 'WOP', 9, 9), B.compoffDays(co, 'HP', 8.5, 9), B.compoffDays(co, 'P', 9, 9), B.compoffDays({ result: 'none' }, 'WOP', 9, 9), B.compoffDays({ result: 'pay', full_shift: false }, 'HP', 2, 9)], [1, 0, 0, 0, 1]);
+  assert.deepStrictEqual(B.importChange('A', 'P'), { to: 'P' }); assert.deepStrictEqual(B.importChange('A', 'hd'), { to: 'HD' }); assert.deepStrictEqual(B.importChange('MIS', 'L'), { to: 'L' });
+  assert.deepStrictEqual(B.importChange('A', 'A'), { skip: true }); assert.deepStrictEqual(B.importChange('P', ''), { skip: true });
+  assert.ok(B.importChange('P', 'A').error && B.importChange('P', 'HD').error && B.importChange('A', 'X').error && B.importChange('WO', 'P').error, 'never against the person, never a day off');
+  // (14-11-2026) an EMPTY day is filled only when it is of before attendance began at the site (the caller says so) – never otherwise
+  assert.ok(B.importChange('', 'P').error && B.importChange('', 'P', false).error); assert.deepStrictEqual(B.importChange('', 'p', true), { to: 'P' }); assert.deepStrictEqual(B.importChange('', 'HD', true), { to: 'HD' }); assert.deepStrictEqual(B.importChange('', 'L', true), { to: 'L' }); assert.ok(B.importChange('', 'A', true).error && B.importChange('WO', 'P', true).error && B.importChange('P', 'A', true).error, 'the favour-only rule is as before for every other day');
+  { const src = fs.readFileSync(path.join(root, 'lib', 'act_import.js'), 'utf8'); assert.match(src, /if \(!was && e\.joined_on && day < e\.joined_on\) \{ refused\.push/); assert.match(src, /if \(!was && e\.left_on && day > e\.left_on\) \{ refused\.push/); assert.match(src, /const before = !was && \(!start \|\| day < start\), c = B\.importChange\(was, to, before\);/); assert.match(fs.readFileSync(path.join(root, 'public', 'book.js'), 'utf8'), /if \(r\.begins\) \{ var bg = el\('p', 'rb-warn'\)/, 'the page says what it means for the others before anything is saved'); }
+  assert.deepStrictEqual(B.importChange('HD', 'P'), { to: 'P' }); assert.deepStrictEqual(B.importChange('L', 'P'), { to: 'P' }); assert.deepStrictEqual(B.importChange('L', 'L'), { skip: true });
+});
+
+test('rule book: leave – a Sunday worked earns one (at most 4 a month), two balances, a leave only while the balance has it, the ledger says where each day came from', () => {
+  const L = require('../lib/leave');
+  // November 2026: Sundays 1, 8, 15, 22, 29. A road site: every day is a working day.
+  const site = { earn: 'sunday', per_month: 4, carry: true, auto_absent: false, strict: true }, day = n => '2026-11-' + String(n).padStart(2, '0');
+  const days = []; for (let i = 1; i <= 30; i++) days.push({ day: day(i), code: i === 8 ? 'A' : i === 15 ? 'HD' : 'P' });
+  let k = L.walk2(days, { polOn: () => site });
+  assert.deepStrictEqual([k.paid, k.comp], [3.5, 0], 'Sundays 1, 22, 29 worked = 3, the 15th half = 0.5, the 8th absent = 0');
+  assert.deepStrictEqual(k.ledger.map(x => [x.day.slice(8), x.days, x.source]), [['01', 1, 'sunday'], ['15', 0.5, 'sunday'], ['22', 1, 'sunday'], ['29', 1, 'sunday']]);
+  assert.deepStrictEqual(k.absent, { [day(8)]: 'none' }, 'absent without a request: nothing is taken, the day is marked');
+  // five Sundays all worked: still 4
+  k = L.walk2(days.map(d => ({ day: d.day, code: 'P' })), { polOn: () => site }); assert.strictEqual(k.paid, 4);
+  // a leave of 3 days with a balance of 1: one day is leave, the others stay absent; a refused request is marked
+  const d2 = []; for (let i = 1; i <= 12; i++) d2.push({ day: day(i), code: i >= 3 && i <= 5 ? 'A' : i === 10 ? 'A' : 'P' });
+  k = L.walk2(d2, { polOn: () => site, leave: { [day(3)]: { days: 1, bucket: 'paid' }, [day(4)]: { days: 1, bucket: 'paid' }, [day(5)]: { days: 1, bucket: 'paid' } }, refused: { [day(10)]: true } });
+  assert.deepStrictEqual(Object.keys(k.marks), [day(3)]); assert.deepStrictEqual(k.absent, { [day(4)]: 'nobalance', [day(5)]: 'nobalance', [day(10)]: 'refused' }); assert.strictEqual(k.paid, 1, '1 (Sunday the 1st) − 1 (leave) + 1 (Sunday the 8th)');
+  // (his correction) ONE leave for the person: the Comp-off days are used first, then the Paid leave – he never chooses; the ledger says from which
+  k = L.walk2(d2, { polOn: () => site, credits: { [day(1)]: [{ bucket: 'paid', days: 6, source: 'opening', reason: 'Opening balance' }], [day(2)]: [{ bucket: 'comp', days: 1.5, source: 'compoff', reason: 'Worked on a holiday' }] }, leave: { [day(3)]: { days: 1 }, [day(4)]: { days: 1 }, [day(5)]: { days: 1 } } });
+  assert.deepStrictEqual([k.marks[day(3)].bucket, k.marks[day(4)].bucket, k.marks[day(5)].bucket], ['comp', 'both', 'paid'], 'the 3rd from Comp-off, the 4th half and half, the 5th from Paid leave');
+  assert.deepStrictEqual([k.paid, k.comp], [6.5, 0], 'paid: 1 (Sunday) + 6 − 0.5 − 1 + 1 (Sunday the 8th); comp-off used up'); assert.deepStrictEqual(k.absent, { [day(10)]: 'none' });
+  assert.ok(k.ledger.some(x => x.source === 'opening' && x.days === 6) && k.ledger.filter(x => x.source === 'leave').map(x => x.bucket + x.days).join(',') === 'comp-1,comp-0.5,paid-0.5,paid-1');
+  // nothing in either balance: the day stays absent
+  k = L.walk2(d2.slice(1, 6), { polOn: () => site, leave: { [day(3)]: { days: 1 } } }); assert.deepStrictEqual([Object.keys(k.marks), k.absent[day(3)]], [[], 'nobalance']);
+  // the Head Office: 1 at the start of every month, carried on; a weekly off or a day at work never takes a leave
+  const ho = { earn: 'month', per_month: 1, carry: true, auto_absent: false, strict: true }, two = [{ day: '2026-10-01', code: 'P' }, { day: '2026-10-02', code: 'P' }, { day: '2026-11-01', code: 'WO' }, { day: '2026-11-02', code: 'A' }, { day: '2026-11-03', code: 'P' }];
+  k = L.walk2(two, { polOn: () => ho, leave: { '2026-11-01': { days: 1, bucket: 'paid' }, '2026-11-02': { days: 1, bucket: 'paid' }, '2026-11-03': { days: 1, bucket: 'paid' } } });
+  assert.deepStrictEqual([k.paid, Object.keys(k.marks)], [1, ['2026-11-02']], 'October\'s leave is carried on: 2, one taken');
+  // no policy of the Rule Book on a day: nothing is earned and nothing is taken there
+  assert.deepStrictEqual(L.walk2(two, { polOn: () => null }).ledger, []);
+  // a policy of before read through the same walk gives the same balance as the old walk (not strict: a leave is taken as asked)
+  const old = { per_month: 4, carry: true, auto_absent: true, valid_from: '2026-11-01' }, od = [{ day: '2026-11-01', code: 'A' }, { day: '2026-11-02', code: 'P' }, { day: '2026-11-03', code: 'A' }];
+  assert.strictEqual(L.walk2(od, { polOn: () => ({ earn: 'month', per_month: 4, carry: true, auto_absent: true, strict: false }) }).paid, L.walk(od, { policies: [old] }).balance);
+});
+
+test('the Rule Book in the pay: approved overtime and comp-off "for pay" – and nothing changes without them', () => {
+  const P = require('../lib/pay'), c = { present: 24, half: 0, leave: 0, week_off: 4, holiday: 0, extra: 2, paid: 30 }, base = { salary: { pay_type: 'monthly', amount: 30000 }, counts: c, month_days: 30, flags: { pf: true }, settings: { pf_pct: 12 }, adjust: {} };
+  const a = P.slip(base); assert.deepStrictEqual([a.day, a.earned, a.extra_days, a.extra, a.gross, a.pf], [1000, 30000, 2, 2000, 32000, 3600]); assert.ok(!('overtime' in a) && !('ot_hours' in a), 'no overtime: the slip has no such line');
+  assert.deepStrictEqual(P.slip(Object.assign({}, base, { extra_days: undefined, overtime: [] })), a, 'nothing of the Rule Book: the very same slip');
+  // a comp-off policy: of the 2 days worked on a day off only the one approved "for pay" is paid
+  const b = P.slip(Object.assign({}, base, { extra_days: 1 })); assert.deepStrictEqual([b.extra_days, b.extra, b.gross], [1, 1000, 31000]); assert.strictEqual(P.slip(Object.assign({}, base, { extra_days: 0 })).extra, 0, 'none approved for pay: no extra day');
+  // overtime: 90 + 30 minutes with an 8-hour shift, plain hourly rate: 1000 / 8 × 2 h = 250; at 1.5 ×: 375; PF stays on the earned pay
+  const o = P.slip(Object.assign({}, base, { overtime: [{ minutes: 90, shift_hours: 8, rate: 1 }, { minutes: 30, shift_hours: 8 }] })); assert.deepStrictEqual([o.ot_hours, o.overtime, o.gross, o.pf], [2, 250, 32250, 3600]);
+  assert.strictEqual(P.slip(Object.assign({}, base, { overtime: [{ minutes: 120, shift_hours: 8, rate: 1.5 }] })).overtime, 375);
+  assert.strictEqual(P.slip(Object.assign({}, base, { overtime: [{ minutes: 120, shift_hours: 0, rate: 1 }] })).overtime, 0, 'no shift hours known: nothing is made up');
+  // a day's rate: the day's pay is the rate itself
+  assert.strictEqual(P.slip({ salary: { pay_type: 'daily', amount: 800 }, counts: c, month_days: 30, flags: {}, settings: {}, overtime: [{ minutes: 60, shift_hours: 8, rate: 1 }] }).overtime, 100);
+  // the totals carry overtime only in a month that has any
+  assert.ok(!('overtime' in P.totals([a, b]))); assert.strictEqual(P.totals([a, o]).overtime, 250); assert.strictEqual(P.totals([a, o]).gross, 64250);
+  const src = fs.readFileSync(path.join(root, 'lib', 'act_payroll.js'), 'utf8'); assert.match(src, /status=eq\.approved&kind=in\.\(overtime,compoff\)/, 'only approved requests count'); assert.match(src, /\(q\.body \|\| \{\}\)\.result === 'pay'/, 'only the ones "for pay"');
+});
+
+test('the Rule Book in the pay: unused leave paid on relieving; nothing is earned after the last day', () => {
+  const P = require('../lib/pay'), L = require('../lib/leave'), c = { present: 10, paid: 12, extra: 0 }, base = { salary: { pay_type: 'monthly', amount: 30000 }, counts: c, month_days: 30, flags: { pf: true }, settings: { pf_pct: 12 }, adjust: {} };
+  const a = P.slip(base), b = P.slip(Object.assign({}, base, { leave_days: 4.5 })); assert.ok(!('leave_pay' in a)); assert.deepStrictEqual([b.leave_pay_days, b.leave_pay, b.gross - a.gross, b.pf], [4.5, 4500, 4500, a.pf]);
+  assert.deepStrictEqual(P.slip(Object.assign({}, base, { leave_days: 0 })), a, 'no days left: the very same slip'); assert.strictEqual(P.totals([a, b]).leave_pay, 4500); assert.ok(!('leave_pay' in P.totals([a])));
+  // the balance as of the last day: the months after it add nothing
+  const days = []; for (let m = 9; m <= 11; m++) for (let d = 1; d <= 28; d++) days.push({ day: '2026-' + String(m).padStart(2, '0') + '-' + String(d).padStart(2, '0'), code: 'P' });
+  const pol = () => ({ earn: 'month', per_month: 2, carry: true, strict: true });
+  assert.strictEqual(L.walk2(days, { polOn: pol }).paid, 6); assert.strictEqual(L.walk2(days, { polOn: pol, last: '2026-10-10' }).paid, 4, 'relieved on 10 October: September and October only'); assert.strictEqual(L.walk2(days, { polOn: pol, last: '' }).paid, 6);
+  const src = fs.readFileSync(path.join(root, 'lib', 'act_payroll.js'), 'utf8'); assert.match(src, /e\.left_on\.slice\(0, 7\) !== month\) continue/, 'only in the month of his last day'); assert.match(src, /lp\.body\.exit !== 'pay'\) continue/, 'only when his policy says so');
+});
+
+test('"All sites": the same sign-in acts on another site only when the Portal wrote that site and his role there into the ticket', () => {
+  const ses = require('../lib/session'), s = { site: 'VTR', email: 'a@x.test', role: 'admin', idHash: 'h', info: { siteName: 'VTR', sites: [{ code: 'VTR', name: 'VTR', role: 'admin' }, { code: 'HO', name: 'Head Office', role: 'user' }, { code: 'B18', name: '18B' }, { code: 'SUP', name: 'S', role: 'super' }] } };
+  assert.strictEqual(ses.as(s, ''), s); assert.strictEqual(ses.as(s, 'VTR'), s, 'his own site: nothing changes');
+  const ho = ses.as(s, 'ho'); assert.deepStrictEqual([ho.site, ho.role, ho.info.siteName, ho.email], ['HO', 'user', 'Head Office', 'a@x.test'], 'on the other site he is what the Portal says he is THERE (a User – not the Admin he is here)');
+  assert.strictEqual(s.site, 'VTR', 'the sign-in itself is not changed');
+  for (const [code, why] of [['B18', 'a site without his role (an older ticket)'], ['NOPE', 'a site that is not his'], ['SUP', 'nobody becomes the Super Admin this way'], ['a b', 'not a site code']]) assert.throws(() => ses.as(s, code), e => e.status === 403, why);
+  assert.throws(() => ses.as(Object.assign({}, s, { role: 'self' }), 'HO'), e => e.status === 403, '"My HR" never');
+  const sup = { site: 'VTR', email: 's@x.test', role: 'super', info: { sites: [{ code: 'HO', name: 'HO', role: 'super' }, { code: 'B18', name: '18B', role: 'admin' }] } };
+  assert.strictEqual(ses.as(sup, 'HO').role, 'super'); assert.throws(() => ses.as(sup, 'B18'), e => e.status === 403, 'the Super Admin\'s sites all say "super" – anything else is not his ticket');
+  // the ticket: the role of each site is kept only when it is a proper one
+  const src = fs.readFileSync(path.join(root, 'lib', 'portal.js'), 'utf8'); assert.match(src, /c\.super === true \? \{ role: 'super' \} : \['admin', 'user'\]\.indexOf\(s\.role\) > -1 \? \{ role: s\.role \} : \{\}/);
+  assert.match(fs.readFileSync(path.join(root, 'api', 'hr.js'), 'utf8'), /const s = Object\.assign\(\{\}, ses\.as\(await ses\.need\(req\), x\.as_site\), \{ origin: /, 'every action goes through it');
+});
+
+test('(Mechanical update-263) the drivers and operators of a site for Mechanical\'s Driver Master: only with the backup secret; only that site, only Driver / Operator; only id, code, name, mobile, category, status, left – nothing written', async () => {
+  const E = require('../api/mech-drivers.js');
+  const env = { BACKUP_EXPORT_SECRET: process.env.BACKUP_EXPORT_SECRET, VERCEL_ENV: process.env.VERCEL_ENV }, f0 = global.fetch;
+  const asked = [];
+  global.fetch = async (url, opt) => { asked.push([String(url), (opt && opt.method) || 'GET']);
+    return new Response(JSON.stringify([{ id: 'e1', code: 'RCL-0007', name: 'Ganesh Shinde', mobile: '9800000044', category: 'driver', status: 'active', left_on: null },
+      { id: 'e2', code: 'RCL-0009', name: 'Kiran Jadhav', mobile: '', category: 'operator', status: 'left', left_on: '2026-10-31' }]), { status: 200 }); };
+  const call = async (body, auth, method) => { let status = 0, out = null;
+    const res = { setHeader() {}, end(t) { out = JSON.parse(t); }, set statusCode(v) { status = v; } };
+    await E({ method: method || 'POST', headers: { authorization: auth === undefined ? 'Bearer ' + 'k'.repeat(30) : auth }, body: body }, res); return { status: status, j: out }; };
+  try {
+    process.env.VERCEL_ENV = 'production'; delete process.env.BACKUP_EXPORT_SECRET;
+    assert.strictEqual((await call({ site: 'S1' })).status, 503, 'not set up: nothing is given');
+    process.env.BACKUP_EXPORT_SECRET = 'k'.repeat(30);
+    assert.strictEqual((await call({ site: 'S1' }, 'Bearer wrong')).status, 401); assert.strictEqual((await call({ site: 'S1' }, '')).status, 401);
+    assert.strictEqual((await call({ site: 'S1' }, undefined, 'GET')).status, 405);
+    assert.strictEqual((await call({ site: 'bad site' })).status, 400); assert.strictEqual(asked.length, 0, 'nothing asked of the database without the secret and a site');
+    const r = await call({ site: 's1' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.j));
+    assert.deepStrictEqual(r.j, { site: 'S1', employees: [{ id: 'e1', code: 'RCL-0007', name: 'Ganesh Shinde', mobile: '9800000044', category: 'Driver', status: 'active', left: '' },
+      { id: 'e2', code: 'RCL-0009', name: 'Kiran Jadhav', mobile: '', category: 'Operator', status: 'left', left: '2026-10-31' }] });
+    assert.deepStrictEqual(asked.map(a => a[1]), ['GET'], 'it only reads');
+    assert.match(asked[0][0], /\/rest\/v1\/hr_employees\?site=eq\.S1&category=in\.\(driver,operator\)&select=id,code,name,mobile,category,status,left_on&order=name\.asc&limit=2000$/);
+  } finally { global.fetch = f0; Object.keys(env).forEach(k => { if (env[k] === undefined) delete process.env[k]; else process.env[k] = env[k]; }); }
+  assert.strictEqual(E.COLS, 'id,code,name,mobile,category,status,left_on', 'no birth date, e-mail, KYC, bank or pay');
+});
+
+test('the backup export (Mechanical update-243): only with the secret; every site and every table (HR\'s own Sheet); never the sign-ins or tickets; the face numbers hidden; "since" only for the lists that only grow', async () => {
+  const E = require('../api/backup-export.js'), T = E.TABLES;
+  const env = { BACKUP_EXPORT_SECRET: process.env.BACKUP_EXPORT_SECRET, VERCEL_ENV: process.env.VERCEL_ENV }, f0 = global.fetch;
+  const asked = [];
+  global.fetch = async (url) => { const u = String(url); asked.push(u);
+    if (/\/rest\/v1\/$/.test(u)) return new Response(JSON.stringify({ definitions: { hr_employees: { properties: { id: {}, code: {}, name: {}, site: {}, later_col: {} } }, hr_faces: { properties: { id: {}, employee_id: {}, descriptors: {} } },
+      hr_punches: { properties: { id: {}, received_at: {} } }, hr_sessions: { properties: { id_hash: {} } }, hr_tickets: { properties: { jti: {} } } } }), { status: 200 });
+    if (/hr_faces\?select=\*/.test(u)) return new Response(JSON.stringify([{ id: 1, employee_id: 7, descriptors: [[0.1, 0.2]] }, { id: 2, employee_id: 8, descriptors: null }]), { status: 200 });
+    return new Response('[]', { status: 200, headers: { 'content-range': '*/3' } }); };
+  const call = async (body, auth) => { let status = 0, out = null;
+    const res = { setHeader() {}, end(t) { out = JSON.parse(t); }, set statusCode(v) { status = v; } };
+    await E({ method: 'POST', headers: { authorization: auth === undefined ? 'Bearer ' + 'k'.repeat(30) : auth }, body: body }, res); return { status: status, j: out }; };
+  try {
+    process.env.VERCEL_ENV = 'production'; delete process.env.BACKUP_EXPORT_SECRET;
+    assert.strictEqual((await call({ action: 'catalog' })).status, 503, 'not set up: nothing is given');
+    process.env.BACKUP_EXPORT_SECRET = 'k'.repeat(30);
+    assert.strictEqual((await call({ action: 'catalog' }, 'Bearer wrong')).status, 401); assert.strictEqual((await call({ action: 'catalog' }, '')).status, 401);
+    assert.strictEqual((await call({ action: 'rows', table: 'hr_employees' }, 'Bearer wrong')).status, 401, 'no row without the secret');
+    asked.length = 0; let r = await call({ action: 'catalog' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.j));
+    assert.deepStrictEqual(r.j.tables.map(t => t.name), ['hr_employees', 'hr_punches', 'hr_faces'], 'the tables this database has; the sign-ins and tickets never');
+    assert.deepStrictEqual(r.j.tables[0].cols, ['id', 'code', 'name', 'site', 'later_col'], 'everything: every column of the table');
+    assert.ok(asked.every(u => !/site=eq\./.test(u)), 'every site: no site filter');
+    asked.length = 0; await call({ action: 'rows', table: 'hr_employees', since: '2026-11-14T08:00:00Z' });
+    assert.ok(/hr_employees\?select=\*&order=id\.asc&offset=0&limit=1000$/.test(asked[0]), 'a table that changes is always given whole: ' + asked[0]);
+    asked.length = 0; await call({ action: 'rows', table: 'hr_punches', since: '2026-11-14T08:00:00Z' });
+    assert.ok(/hr_punches\?select=\*&received_at=gte\.2026-11-14T08%3A00%3A00Z&order=id\.asc/.test(asked[0]), asked[0]);
+    r = await call({ action: 'rows', table: 'hr_faces' });
+    assert.deepStrictEqual(r.j.rows, [{ id: 1, employee_id: 7, descriptors: { __hidden: true } }, { id: 2, employee_id: 8, descriptors: null }], 'the face numbers never leave');
+    for (const t of ['hr_sessions', 'hr_tickets', 'web_props', '__proto__']) assert.strictEqual((await call({ action: 'rows', table: t })).status, 400, t);
+    assert.strictEqual((await call({ action: 'usage' })).status, 400);
+    assert.strictEqual((await call({ action: 'rows', table: 'hr_audit', since: "x';--" })).status, 400);
+    assert.strictEqual((await call({ action: 'catalog' }, undefined)).status, 200);
+  } finally { global.fetch = f0; Object.keys(env).forEach(k => { if (env[k] === undefined) delete process.env[k]; else process.env[k] = env[k]; }); }
+  // EVERY table of HR's database steps is in the list – except the sign-ins and the used tickets
+  const made = new Set(); fs.readdirSync(path.join(root, 'sql')).filter(f => /^hr_step\d+_.*\.sql$/.test(f)).forEach(f => { const s = fs.readFileSync(path.join(root, 'sql', f), 'utf8'), re = /create table if not exists public\.(hr_[a-z_]+)/g; let m; while ((m = re.exec(s))) made.add(m[1]); });
+  assert.ok(made.size > 40, 'the steps were read: ' + made.size);
+  assert.deepStrictEqual([...made].filter(t => !T[t]).sort(), ['hr_sessions', 'hr_tickets'], 'a new table must be put in api/backup-export.js');
+  assert.deepStrictEqual(Object.keys(T).filter(t => !made.has(t)), [], 'no table that does not exist');
+  assert.deepStrictEqual(Object.keys(T).filter(t => T[t].since).sort(), ['hr_ai_runs', 'hr_audit', 'hr_cpolicy_accepts', 'hr_day_entries', 'hr_device_tries', 'hr_doc_events', 'hr_face_consents', 'hr_face_tries', 'hr_job_runs', 'hr_leave_adjust', 'hr_leave_credits', 'hr_notify_events', 'hr_pay_checks', 'hr_pay_payments', 'hr_pay_release', 'hr_punch_reviews', 'hr_punches']);
+  assert.deepStrictEqual(Object.keys(T).filter(t => T[t].hide || T[t].cols), ['hr_faces', 'hr_invites', 'hr_email_checks']); assert.deepStrictEqual(T.hr_faces.hide, ['descriptors']);
+  assert.deepStrictEqual([T.hr_invites.hide, T.hr_email_checks.hide], [['token_hash'], ['token_hash']], '(step 15) a link\'s fingerprint never leaves');
+  assert.ok(Object.keys(T).every(t => T[t].title && T[t].title.length <= 60 && /^[a-z_]+(,[a-z_]+)*$/.test(T[t].key)));
+  assert.strictEqual(new Set(Object.keys(T).map(t => T[t].title)).size, Object.keys(T).length, 'every tab has its own name');
+});
+
+test('the language of the HR web (14-11-2026): English until the person chooses; the picker on top; his own choice kept with his sign-in; the words files are sound', async () => {
+  const html = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), eng = fs.readFileSync(path.join(root, 'public', 'i18n.js'), 'utf8');
+  // English is what the page's own code says: no label carries a second language any more (the three-language notices before the sign-in stay)
+  for (const f of fs.readdirSync(path.join(root, 'public')).filter(x => /\.js$/.test(x) && x !== 'i18n.js')) {
+    const bad = fs.readFileSync(path.join(root, 'public', f), 'utf8').split('\n').filter(l => /'[^']* · [ऀ-ॿ][^'·]*'/.test(l) && !/[ऀ-ॿ][^']* · [^']*[ऀ-ॿ]/.test(l));
+    assert.deepStrictEqual(bad.map(l => l.trim().slice(0, 80)), [], f + ': a label with Marathi in it – the words belong in public/i18n/mr.json');
+  }
+  assert.ok(!/>[^<>]* · [ऀ-ॿ][^<>·]*</.test(html.replace(/<script[\s\S]*?<\/script>/g, '')), 'the page\'s markup is English');
+  // the picker: on top next to the site, never turned itself, hidden inside "All sites" and for "My HR"
+  assert.match(html, /<select id="site_pick"[^>]*><\/select><select id="lang_pick" class="dz-pill" data-noi18n [^>]*hidden><option value="en">English<\/option><option value="mr">मराठी<\/option><option value="hi">हिंदी<\/option><\/select>/);
+  assert.match(html, /sel\.hidden = !!AS \|\| me\.user\.role === 'self'; L\.set\(cur\);/);
+  assert.ok(/api\('api\/hr', \{ action: 'langSet', lang: v \}\)\.then\(function \(\) \{/.test(html) && html.indexOf('location.reload(); },', html.indexOf("action: 'langSet'")) > -1, 'saved with the person first, then the page opens again in it');
+  assert.ok(html.indexOf('<script src="i18n.js"></script>') > -1 && html.indexOf('<script src="i18n.js"></script>') < html.indexOf('<script src="dash.js"></script>'));
+  assert.match(eng, /var SKIP = 'script, style, textarea, code, pre, svg, \[data-noi18n\], \[contenteditable="true"\]';/, 'what is typed is never turned');
+  // the choice is the PERSON's: one row of the settings table of step 6 (no new step), read with the sign-in
+  const L = require('../lib/lang.js'), src = fs.readFileSync(path.join(root, 'lib', 'lang.js'), 'utf8');
+  assert.match(src, /const SITE = '\*', KEY = 'web_lang';/); assert.ok(/^[a-z_]{2,40}$/.test('web_lang'), 'a key the table of step 6 allows');
+  assert.match(fs.readFileSync(path.join(root, 'api', 'me.js'), 'utf8'), /lang: await lang\.of\(s\.email\)/);
+  const HR = require('../api/hr.js'); assert.strictEqual(typeof HR.ACT.langSet, 'function'); assert.ok(HR.SELF.indexOf('langSet') < 0);
+  const f0 = global.fetch, asked = []; let row = { by: { 'other@rcl.test': 'hi' } };
+  global.fetch = async (u, o) => { asked.push([String(u), o && o.method, o && o.body]); if (o && o.method === 'POST') { row = JSON.parse(o.body)[0].value; return { ok: true, status: 201, text: async () => '', json: async () => null }; }
+    return { ok: true, status: 200, text: async () => JSON.stringify([{ value: row }]), json: async () => [{ value: row }] }; };
+  try {
+    const s = { email: 'Me@RCL.test', site: 'S1', role: 'user' };
+    assert.strictEqual(await L.of('nobody@rcl.test'), '', 'nothing chosen = English'); assert.strictEqual(await L.of('OTHER@rcl.test'), 'hi');
+    assert.deepStrictEqual(await L.ACT.langSet(s, { lang: 'mr' }), { lang: 'mr' }); assert.deepStrictEqual(row, { by: { 'other@rcl.test': 'hi', 'me@rcl.test': 'mr' } }, 'only his own line changes');
+    assert.strictEqual(await L.of('me@rcl.test'), 'mr');
+    await L.ACT.langSet(s, { lang: 'en' }); assert.deepStrictEqual(row, { by: { 'other@rcl.test': 'hi' } }, 'English: he is taken out of the row');
+    await assert.rejects(() => L.ACT.langSet(s, { lang: 'fr' }), /Language/);
+    assert.ok(asked.every(a => /hr_settings\?/.test(a[0])), 'nothing else is touched');
+    global.fetch = async () => { throw new Error('down'); }; assert.strictEqual(await L.of('me@rcl.test'), '', 'the database cannot be asked: English, the page still opens');
+  } finally { global.fetch = f0; }
+  // the words: both files hold the same texts, each one a text the module can show, with the same parts to fill in
+  const keys = new Set(JSON.parse(fs.readFileSync(path.join(root, 'public', 'i18n', 'keys.json'), 'utf8'))), mr = JSON.parse(fs.readFileSync(path.join(root, 'public', 'i18n', 'mr.json'), 'utf8')), hi = JSON.parse(fs.readFileSync(path.join(root, 'public', 'i18n', 'hi.json'), 'utf8'));
+  assert.deepStrictEqual(Object.keys(mr), Object.keys(hi)); assert.ok(Object.keys(mr).length > 900, 'the words are there: ' + Object.keys(mr).length);
+  const parts = t => (t.match(/\{\d+\}/g) || []).sort().join();
+  for (const d of [mr, hi]) for (const k of Object.keys(d)) {
+    assert.ok(keys.has(k), 'not a text of the module: ' + k); assert.ok(typeof d[k] === 'string' && d[k].trim(), 'empty: ' + k);
+    assert.strictEqual(parts(d[k]), parts(k), 'the parts to fill in differ: ' + k);
+  }
+  // the engine: a whole text, a pattern with its parts, a text without a translation, a typed name
+  const win = {}, vm2 = require('vm'); vm2.runInNewContext(eng, { window: win, document: { body: null, addEventListener() {}, documentElement: {} }, localStorage: { getItem: () => '', setItem() {} }, Map, WeakMap, Set, Promise, RegExp, Object, String, Array, console });
+  win.HRLANG._use(mr);
+  assert.strictEqual(win.HRLANG.as('Present'), 'हजर'); assert.strictEqual(win.HRLANG.as('  Employees '), '  कर्मचारी ');
+  assert.strictEqual(win.HRLANG.as('Yesterday: 4'), 'काल: 4'); assert.strictEqual(win.HRLANG.as('3 of 36 on duty right now'), '36 पैकी 3 आत्ता कामावर');
+  assert.strictEqual(win.HRLANG.as('Suresh Patil'), 'Suresh Patil', 'a name stays as it was typed'); assert.strictEqual(win.HRLANG.as('RCL001'), 'RCL001');
+  win.HRLANG._use(hi); assert.strictEqual(win.HRLANG.as('Present'), 'उपस्थित'); assert.strictEqual(win.HRLANG.as('Yesterday: 4'), 'कल: 4');
+});
+
+test('the Rule Book\'s simpler form (14-11-2026): every number is chosen from a list; the suggestions are policies the server accepts; a policy is of its own site (18-11-2026)', () => {
+  const js = fs.readFileSync(path.join(root, 'public', 'book.js'), 'utf8'), RB = require('../lib/rulebook.js');
+  const a = js.indexOf('  var UNIT = {'), b = js.indexOf('  function pickIn(list, v) {'); assert.ok(a > -1 && b > a);
+  const X = new Function(js.slice(a, b) + '; return { UNIT: UNIT, USUAL: USUAL, IDEAS: IDEAS };')();
+  // every number of a policy has its list of usual values, with a unit the page can say
+  const numbers = ['full_hours', 'half_hours', 'grace_min', 'early_min', 'free', 'half_after_min', 'half_before_min', 'per_month', 'exit_max', 'after_min', 'round_min', 'rate'];
+  assert.deepStrictEqual(Object.keys(X.USUAL).sort(), numbers.slice().sort());
+  for (const k of numbers) { assert.ok(X.USUAL[k][0].length >= 3 && typeof X.UNIT[X.USUAL[k][1]] === 'function', k); assert.match(js, new RegExp("N\\('" + k + "', '"), k + ' is asked with a list'); }
+  assert.ok(!/field\(f, label, numIn\(/.test(js), 'no number of a policy is a bare typing box any more');
+  assert.match(js, /add\('', 'Not applied'\);/); assert.match(js, /add\('other', 'Other – type it'\);/);
+  // the suggestions: for each of the six kinds, and each one is a policy the server takes as it is
+  assert.deepStrictEqual(Object.keys(X.IDEAS), ['attendance', 'late', 'weekoff', 'leave', 'compoff', 'overtime']);
+  for (const kind of Object.keys(X.IDEAS)) for (const [name, v] of X.IDEAS[kind]) {
+    const typed = kind === 'weekoff' ? { days: v.w, nth: v.nth } : v, r = RB.body(kind, typed);
+    assert.deepStrictEqual(r.errors, [], kind + ' – ' + name); assert.ok(name.length <= 80);
+    if (kind !== 'weekoff') Object.keys(v).forEach(k => { if (numbers.indexOf(k) > -1) assert.strictEqual(r.body[k], v[k], kind + ' – ' + name + ': ' + k); });
+  }
+  assert.match(js, /if \(!p && IDEAS\[kind\]\)/, 'a suggestion is offered for a NEW policy only');
+  // (18-11-2026, his correction) a policy is of its own site: nothing to tick, no "every site" – the page sends no sites and the
+  // server keeps the site open at the top
+  assert.ok(!/'Every site'\], \['some'/.test(js) && !/sites: sites\.list\(\)/.test(js), 'no "every site" to choose any more');
+  assert.match(js, /field\(g, 'Site', forSite, p \? '' : /); assert.match(js, /valid_from: from\.value, body: body, auth:/);
+  assert.match(js, /plain\.appendChild\(el\('b', '', 'In plain words'\)\)/);
+});
+
+test('(step 14, 18-11-2026 – Phase 1) security: SQL step 14 only adds (and takes TRUNCATE away); nobody decides his own – in every decision; PAN masked; plain database errors; the e-mail says when it is not set up; the sealed server time; the consent words', async () => {
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step14_security.sql'), 'utf8'), body = sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.ok(!/\b(drop |delete from|truncate table|update public\.)/i.test(body), 'step 14 deletes and changes nothing');
+  assert.deepStrictEqual((body.match(/create table if not exists public\.(\w+)/g) || []).map(x => x.split('.')[1]), ['hr_bank_changes', 'hr_face_consents', 'hr_selfie_holds', 'hr_job_runs']);
+  assert.match(body, /alter table public\.hr_devices add column if not exists key_hash text not null default ''/);
+  assert.match(body, /revoke truncate on public\.hr_punches, public\.hr_punch_reviews, public\.hr_device_tries, public\.hr_face_tries, public\.hr_pay_settings,\s+public\.hr_pay_runs, public\.hr_payslips, public\.hr_face_consents from service_role/);
+  assert.match(body, /grant select, insert on public\.hr_face_consents to service_role/); assert.ok(!/grant[^;]*(update|delete)[^;]*hr_face_consents/.test(body), 'a consent is only added');
+  assert.match(body, /revoke all on function public\.hr_selfies_due\(timestamptz, integer\) from public, anon, authenticated/);
+  // nobody decides his own (the Super Admin excepted, as for the salary)
+  const src = f => fs.readFileSync(path.join(root, f), 'utf8');
+  assert.match(src('lib/act_leave.js'), /await OWN\.notOwn\(s, q\.employee_id, 'decide this leave for'\)/);
+  assert.match(src('lib/act_muster.js'), /await OWN\.notOwn\(s, emp\.id, 'set a day of attendance for'\)/); assert.match(src('lib/act_muster.js'), /await OWN\.notOwn\(s, r\.employee_id, 'decide this request for'\)/);
+  assert.match(src('lib/act_asks.js'), /s\.role !== 'super' && ask\.stage === 'approve'\) throw fail\(403, 'The one who asked cannot approve it himself\.'/); assert.match(src('lib/act_asks.js'), /await OWN\.notOwn\(s, ask\.employee_id,/);
+  assert.match(src('lib/act_pay.js'), /await OWN\.notOwn\(s, r\.employee_id, 'approve the salary of'\)/); assert.match(src('lib/act_attend.js'), /await OWN\.notOwn\(s, d\.employee_id, 'release the attendance phone of'\)/);
+  assert.match(src('lib/act_month.js'), /const own = await OWN\.mineOf\(s, ids\);[\s\S]{0,400}This is your own month – another person of the HR office verifies it\./);
+  const OWN = require('../lib/own');
+  assert.ok(OWN.isMe({ email: 'A@b.test' }, { email: 'a@B.test ' }) && OWN.isMe({ email: '9999999999@mobile.id' }, { email: '', portal_email: '9999999999@mobile.id' }) && !OWN.isMe({ email: '' }, { email: '' }) && !OWN.isMe({ email: 'a@b.test' }, null));
+  await OWN.notOwn({ role: 'super', email: 'x@y.test' }, 'any-id', 'x');      // the Super Admin: never asked
+  // PAN masked for an HR User; the sheet gives him none
+  assert.strictEqual(require('../lib/rules').panMask('ABCDE1234F'), 'XXXXXX234F');
+  assert.match(src('api/hr.js'), /pan: isAdmin\(s\) \? \(p\.pan \|\| ''\) : '', pan_mask: R\.panMask\(p\.pan\)/); assert.match(src('lib/act_sheet.js'), /col\.key === 'aadhaar' \|\| col\.key === 'pan' \|\|/);
+  // the database's own words go to the log only
+  assert.match(src('lib/db.js'), /const er = fail\(500, 'The HR database could not do this – please try again\. If it stays, tell the Super Admin\.', 'db'\); er\.detail = last; throw er;/); assert.ok(!/'Database: ' \+ last/.test(src('lib/db.js')));
+  // the e-mail: not set up = said so, nothing pretends; no e-mail in his record = said so
+  const MAIL = require('../lib/mail'), k0 = process.env.RESEND_API_KEY; delete process.env.RESEND_API_KEY;
+  try { assert.deepStrictEqual(await MAIL.send([{ to: 'a@b.test', subject: 's', text: 't' }]), [{ sent: false, why: 'e-mail is not set up (RESEND_API_KEY, MAIL_FROM)' }]); } finally { if (k0 !== undefined) process.env.RESEND_API_KEY = k0; }
+  // the bank: only the four details wait; a real change only
+  const B = require('../lib/act_bank'); assert.deepStrictEqual(B.BANK, ['bank_name', 'bank_ifsc', 'bank_account', 'bank_holder']);
+  assert.ok(B.same({ bank_account: '1' }, { bank_account: '1', uan: '9' }) && !B.same({ bank_account: '1' }, { bank_account: '2' }));
+  // the sealed server time: only the server's seal fits, for this employee
+  const A = require('../lib/attend'), now = Date.now(), base = now - 3600000, x = { offline: true, anchor_server: base, anchor_elapsed: 1000, elapsed: 1000 + 3000000, at_device: new Date(base + 3000000).toISOString() };
+  assert.deepStrictEqual(A.moment(Object.assign({ anchor_sig: A.anchorSig('emp-1', base) }, x), now, 'emp-1').why, []);
+  assert.match(A.moment(Object.assign({ anchor_sig: A.anchorSig('emp-2', base) }, x), now, 'emp-1').why.join(), /not the server's/, 'another person\'s seal does not fit');
+  assert.deepStrictEqual(A.moment(x, now, 'emp-1').why, [], 'an old app without a seal: as before');
+  process.env.HR_ANCHOR_REQUIRED = 'true'; try { assert.match(A.moment(x, now, 'emp-1').why.join(), /no sealed server time/); } finally { delete process.env.HR_ANCHOR_REQUIRED; }
+  // the consent words: three languages, the same points; the version follows the words
+  const C = require('../lib/consent'); assert.deepStrictEqual(C.LANGS, ['en', 'mr', 'hi']); assert.ok(C.LANGS.every(l => C.TEXT[l].points.length === 6 && C.TEXT[l].agree && C.TEXT[l].title)); assert.match(C.VERSION, /^f1-[0-9a-f]{10}$/);
+  // the timed job: daily, only with Vercel's secret; off until switched on; at least 90 days
+  const vj = JSON.parse(src('vercel.json')); assert.deepStrictEqual(vj.crons, [{ path: '/api/jobs?job=retention', schedule: '30 21 * * *' }]);
+  const RET = require('../lib/retention'), d0 = process.env.SELFIE_DAYS; process.env.SELFIE_DAYS = '30'; try { assert.strictEqual(RET.daysOf(), 90, 'never shorter than 90 days'); process.env.SELFIE_DAYS = '120'; assert.strictEqual(RET.daysOf(), 120); } finally { if (d0 === undefined) delete process.env.SELFIE_DAYS; else process.env.SELFIE_DAYS = d0; }
+});
+
+test('(step 15) SQL: only adds; nine new tables, every one for the server only; the only thing dropped is the paper-kind check (made wider); the "only added" lists cannot be changed or emptied', () => {
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step15_employee.sql'), 'utf8').replace(/--.*$/gm, '');
+  const made = (sql.match(/create table if not exists public\.(\w+)/g) || []).map(x => x.split('.')[1]);
+  assert.deepStrictEqual(made, ['hr_doc_events', 'hr_doc_na', 'hr_reporting', 'hr_insurance', 'hr_invites', 'hr_email_checks', 'hr_cpolicies', 'hr_cpolicy_versions', 'hr_cpolicy_accepts']);
+  assert.match(sql, new RegExp("foreach t in array array\\[" + made.map(t => "'" + t + "'").join(', ') + "\\] loop\\s+execute format\\('alter table public\\.%I enable row level security', t\\);\\s+execute format\\('revoke all on public\\.%I from public, anon, authenticated', t\\);"));
+  assert.deepStrictEqual(sql.match(/\bdrop [a-z]+ [a-z_.]+/gi), ['drop constraint hr_employee_docs_kind_check'], 'only the narrower check is replaced');
+  assert.ok(!/\btruncate\b(?! on)|delete from|drop table/i.test(sql));
+  assert.match(sql, /grant select, insert on public\.hr_doc_events, public\.hr_cpolicy_accepts to service_role;/); assert.match(sql, /revoke truncate on public\.hr_doc_events, public\.hr_cpolicy_accepts from service_role;/);
+  assert.match(sql, /token_hash text not null unique/, 'a link\'s code: only its fingerprint');
+  assert.match(sql, /add column if not exists can_in boolean not null default true/); assert.match(sql, /add column if not exists status text not null default 'submitted'/, 'every row of today keeps working');
+  assert.match(sql, /'HR step 15 done · new tables ' \|\|/);
+});
+
+test('(step 15) the onboarding link: the door takes only its own actions; the code goes in the body, never in an address; only its fingerprint is written; the bank is all four or none; the pages put text as text', () => {
+  const door = fs.readFileSync(path.join(root, 'api', 'onboard.js'), 'utf8'), onb = fs.readFileSync(path.join(root, 'lib', 'act_onboard.js'), 'utf8');
+  assert.match(door, /const ACTIONS = \['open', 'save', 'uploadUrl', 'docAdd', 'docDrop', 'docNa', 'emailCode', 'emailVerify', 'accept', 'submit', 'verify'\];/); assert.match(door, /sameSite\(req\);/); assert.match(door, /await require\('\.\.\/lib\/step15'\)\.need\(\);/);
+  assert.ok(!/token_hash: token\b|token_hash: t\b/.test(onb) && /token_hash: sha\(token\)/.test(onb), 'only the fingerprint');
+  assert.match(onb, /crypto\.randomBytes\(32\)\.toString\('base64url'\)/); assert.match(onb, /crypto\.randomInt\(0, 1000000\)/);
+  const O = require('../lib/act_onboard')({ newCodes: async () => [], taken: async () => ({ mobile: {}, email: {} }) });
+  assert.deepStrictEqual(O.FORM.map(g => g.key), ['who', 'contact', 'address', 'ids']);
+  assert.match(O.clean({ bank_name: 'X Bank' }, false).errors.join(), /fill all four/); assert.deepStrictEqual(O.clean({ pin: '411001', name: 'A B' }, false), { row: { name: 'A B', pin: '411001' }, errors: [] });
+  assert.match(O.clean({}, true).errors.join(' '), /Full name \(as on Aadhaar\): needed\..*Aadhaar number: needed\./);
+  const pg = fs.readFileSync(path.join(root, 'public', 'onboard.js'), 'utf8'), e15 = fs.readFileSync(path.join(root, 'public', 'emp15.js'), 'utf8'), html = fs.readFileSync(path.join(root, 'public', 'onboard.html'), 'utf8');
+  for (const s of [pg, e15]) assert.ok(!/innerHTML|insertAdjacentHTML|document\.write/.test(s), 'only textContent');
+  assert.match(pg, /fetch\('api\/onboard', \{ method: 'POST'/); assert.ok(!/api\/onboard\?/.test(pg), 'the code is never in an address');
+  assert.match(html, /<meta name="referrer" content="no-referrer">/);
+  const idx = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'); assert.match(idx, /<script src="emp15\.js"><\/script>/); assert.match(idx, /<section id="p_15" hidden><\/section>/); assert.match(idx, /<div id="d_15"><\/div>/);
+});
+
+test('(step 18) payroll phase 5: the new numbers are optional (the pay of today stays as it is); a structure\'s parts; PF on the Basic; the employer\'s PF split; LWF only in its months; TDS never more than what is left; the years for gratuity', () => {
+  const P = require('../lib/pay'), X = require('../lib/act_payx'), c = { paid: 31, present: 31 };
+  // nothing new set: exactly as before – no components, no employer, no LWF / TDS keys
+  const base = P.slip({ salary: { pay_type: 'monthly', amount: 31000 }, counts: c, month_days: 31, flags: { pf: true }, settings: { pf_pct: 12, pf_cap: 15000 }, adjust: {} });
+  assert.deepStrictEqual([base.pf, base.net, 'components' in base, 'employer' in base, 'lwf' in base, 'tds' in base, 'ctc' in base], [1800, 29200, false, false, false, false, false]);
+  assert.deepStrictEqual(Object.keys(P.totals([base])), P.SUM, 'the totals of before');
+  assert.deepStrictEqual(P.settings({}).settings, {}); assert.deepStrictEqual(P.settings({ pf_base: 'earned' }).settings, {}, 'the earned pay = as today, nothing kept');
+  assert.match(P.settings({ pf_base: 'ctc', lwf_months: '0', eps_pct: 'x' }).errors.join(' '), /EPS %.*PF on.*LWF months/);
+  assert.deepStrictEqual(P.settings({ lwf_months: '12, 6, 6', source: '  Circular  of 2026 ' }).settings, { lwf_months: [6, 12], source: 'Circular of 2026' });
+  // the parts: the last without a % takes the rest; parts below 100 % get "Other allowance"; always the whole amount
+  assert.deepStrictEqual(P.parts([{ key: 'basic', name: 'Basic', pct: 40 }, { key: 'hra', name: 'HRA', pct: 20 }], 1000).map(p => p.key + ':' + p.amount), ['basic:400', 'hra:200', 'rest:400']);
+  assert.deepStrictEqual(P.parts([{ key: 'basic', name: 'Basic', pct: 33.33 }, { key: 'sp', name: 'Special' }], 1000.01).map(p => p.amount), [333.3, 666.71]);
+  assert.strictEqual(P.parts([], 100), null); assert.strictEqual(P.basicOf([{ key: 'basic_salary', amount: 5 }]), 5);
+  assert.deepStrictEqual(X.partsOf([{ name: 'Basic', pct: '50%' }, { name: 'H.R.A.', pct: 20 }, { name: 'Special' }]).parts, [{ key: 'basic', name: 'Basic', pct: 50 }, { key: 'h_r_a', name: 'H.R.A.', pct: 20 }, { key: 'special', name: 'Special' }]);
+  assert.match(X.partsOf([{ name: 'Basic', pct: 60 }, { name: 'Basic', pct: 50 }]).errors.join(' '), /the same part twice.*more than 100 %/); assert.match(X.partsOf([]).errors.join(), /at least one part/);
+  // PF on the Basic; EPS out of the employer's whole %; capped wages
+  const set = { pf_pct: 12, pf_cap: 15000, pf_base: 'basic', pf_er_pct: 12, eps_pct: 8.33, eps_cap: 15000, edli_pct: 0.5, pf_admin_pct: 0.5, esic_pct: 0.75, esic_er_pct: 3.25, esic_limit: 21000, lwf_ee: 25, lwf_er: 75, lwf_months: [6, 12] };
+  const st = [{ key: 'basic', name: 'Basic', pct: 50 }, { key: 'hra', name: 'HRA' }];
+  let s = P.slip({ salary: { pay_type: 'monthly', amount: 40000 }, counts: c, month_days: 31, flags: { pf: true, lwf: true }, settings: set, structure: st, month: '2026-12', tds: 500 });
+  assert.deepStrictEqual([s.components.map(p => p.amount), s.pf, s.employer, s.lwf, s.tds, s.net], [[20000, 20000], 1800, { eps: 1250, epf: 550, edli: 75, pf_admin: 75, pf_wage: 15000, lwf: 75 }, 25, 500, 37675]);
+  assert.strictEqual(s.ctc, 40000 + 1250 + 550 + 75 + 75 + 75);
+  s = P.slip({ salary: { pay_type: 'monthly', amount: 40000 }, counts: c, month_days: 31, flags: { pf: true, lwf: true }, settings: set, structure: st, month: '2026-11' }); assert.ok(!('lwf' in s), 'LWF only in its months');
+  s = P.slip({ salary: { pay_type: 'monthly', amount: 3100 }, counts: { paid: 1 }, month_days: 31, flags: {}, settings: {}, tds: 5000 }); assert.deepStrictEqual([s.tds, s.net], [100, 0], 'TDS never more than the pay left');
+  // the years for gratuity: a part of a year above six months counts as a year
+  assert.deepStrictEqual(X.service('2021-01-01', '2026-06-30'), { full: 5, counted: 5 }); assert.deepStrictEqual(X.service('2021-01-01', '2026-07-02'), { full: 5, counted: 6 }); assert.deepStrictEqual(X.service('2026-01-10', '2026-02-01'), { full: 0, counted: 0 });
+  assert.strictEqual(X.sumLines([{ kind: 'earn', amount: 100.5 }, { kind: 'ded', amount: 40.25 }]), 60.25);
+});
+
+test('(step 18) SQL: only adds; six new tables for the server only; three columns with defaults (everybody keeps his pay); the payments, the release and the checks are only added; the actions are the HO HR\'s and write no amount', () => {
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step18_payroll.sql'), 'utf8').replace(/--.*$/gm, '');
+  const made = (sql.match(/create table if not exists public\.(\w+)/g) || []).map(x => x.split('.')[1]);
+  assert.deepStrictEqual(made, ['hr_pay_structures', 'hr_pay_structure_versions', 'hr_pay_checks', 'hr_pay_release', 'hr_pay_payments', 'hr_fnf']);
+  assert.match(sql, new RegExp("foreach t in array array\\[" + ['hr_pay_structures', 'hr_pay_structure_versions', 'hr_pay_checks', 'hr_pay_release', 'hr_pay_payments', 'hr_fnf'].map(t => "'" + t + "'").join(', ') + "\\] loop\\s+execute format\\('alter table public\\.%I enable row level security', t\\);\\s+execute format\\('revoke all on public\\.%I from public, anon, authenticated', t\\);"));
+  assert.ok(!/\btruncate\b(?! on)|delete from|drop table|drop column|\bupdate public\./i.test(sql), 'nothing of today is removed or changed');
+  assert.deepStrictEqual(sql.match(/add column if not exists [a-z_]+ [^;]+;/g), ['add column if not exists structure_id bigint references public.hr_pay_structures (id);', 'add column if not exists lwf boolean not null default false;', 'add column if not exists tds_monthly numeric(12, 2) not null default 0;']);
+  assert.match(sql, /grant select, insert on public\.hr_pay_checks, public\.hr_pay_release, public\.hr_pay_payments to service_role;/); assert.match(sql, /revoke truncate on public\.hr_pay_checks, public\.hr_pay_release, public\.hr_pay_payments from service_role;/);
+  assert.match(sql, /create unique index if not exists hr_fnf_one_open on public\.hr_fnf \(employee_id\) where status <> 'cancelled';/); assert.match(sql, /'HR step 18 done · new tables ' \|\|/);
+  const src = fs.readFileSync(path.join(root, 'lib', 'act_payx.js'), 'utf8'), { ACT } = require('../lib/act_payx');
+  Object.keys(ACT).forEach(k => assert.match(String(ACT[k]), /await PR\.needHo\(s\)/, k + ': the HO HR only'));
+  assert.ok(!/'DELETE'/.test(src)); assert.ok(!/audit\([^;]*(amount|net|ref\b|uan)/.test(src), 'no amount, reference or number in the audit');
+  assert.match(String(ACT.structApprove), /lower\(v\.created_by\) === lower\(s\.email\) && s\.role !== 'super'/); assert.match(String(ACT.fnfStep), /lower\(f\.made_by\) === me && !sup/); assert.match(String(ACT.fnfStep), /\(lower\(f\.made_by\) === me \|\| lower\(f\.checked_by\) === me\) && !sup/);
+});
+
+test('(step 19) AI: off until switched on; one door for both providers; every call logged with tokens and cost – never the question or the answer; the AI actions never write anything else', async () => {
+  const AI = require('../lib/ai'), env = {}, keys = ['HR_AI_ENABLED', 'HR_AI_PROVIDER', 'HR_AI_MODEL', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'HR_AI_PRICE', 'HR_AI_MONTHLY_USD', 'HR_AI_API_BASE'];
+  keys.forEach(k => { env[k] = process.env[k]; delete process.env[k]; });
+  const s = { site: 'S1', email: 'admin@rcl.test', role: 'admin' }, f0 = global.fetch, logged = [], asked = [];
+  try {
+    assert.strictEqual(AI.on(), false); await assert.rejects(() => AI.call({ s, purpose: 'ask', text: 'x' }), /not switched on/);
+    Object.assign(process.env, { HR_AI_ENABLED: 'true', HR_AI_PROVIDER: 'anthropic', HR_AI_MODEL: 'test-model', ANTHROPIC_API_KEY: 'k-test', HR_AI_PRICE: '{"in":3,"out":15}', HR_AI_API_BASE: 'https://ai.test' });
+    global.fetch = async (u, o) => { u = String(u);
+      if (u.startsWith('https://ai.test')) { asked.push([u, o.headers, JSON.parse(o.body)]); const ant = /\/v1\/messages$/.test(u);
+        const j = ant ? { content: [{ type: 'text', text: 'Here: {"name":"A B","number":"X1"}' }], usage: { input_tokens: 1000, output_tokens: 100 } } : { choices: [{ message: { content: 'Plain answer' } }], usage: { prompt_tokens: 2000, completion_tokens: 200 } };
+        return { ok: true, status: 200, json: async () => j, text: async () => JSON.stringify(j) }; }
+      if (o && o.method === 'POST') { logged.push(JSON.parse(o.body)[0]); return { ok: true, status: 201, text: async () => '', json: async () => null }; }
+      return { ok: true, status: 200, text: async () => '[]', json: async () => [] }; };
+    assert.deepStrictEqual(AI.status(), { on: true, provider: 'anthropic', model: 'test-model', priced: true, limit: null });
+    let r = await AI.call({ s, purpose: 'ocr', system: 'sys', text: 'Read', image: { mime: 'image/jpeg', base64: 'AAAA' } });
+    assert.deepStrictEqual([r.tokens_in, r.tokens_out, r.cost_usd, AI.json(r.text)], [1000, 100, 0.0045, { name: 'A B', number: 'X1' }]);
+    assert.strictEqual(asked[0][1]['x-api-key'], 'k-test'); assert.deepStrictEqual(asked[0][2].messages[0].content.map(c => c.type), ['image', 'text']); assert.strictEqual(asked[0][2].model, 'test-model');
+    Object.assign(process.env, { HR_AI_PROVIDER: 'openai', OPENAI_API_KEY: 'o-test' }); r = await AI.call({ s, purpose: 'ask', system: 'sys', text: 'Q?' });
+    assert.deepStrictEqual([r.text, r.cost_usd], ['Plain answer', 0.009]); assert.strictEqual(asked[1][1].Authorization, 'Bearer o-test'); assert.deepStrictEqual(asked[1][2].messages.map(m => m.role), ['system', 'user']);
+    assert.deepStrictEqual(logged.map(l => [l.purpose, l.provider, l.tokens_in, l.cost_usd, l.ok]), [['ocr', 'anthropic', 1000, 0.0045, true], ['ask', 'openai', 2000, 0.009, true]]);
+    assert.ok(logged.every(l => Object.keys(l).sort().join() === 'by,cost_usd,error,model,ms,ok,provider,purpose,site,tokens_in,tokens_out'), 'the log has no question, paper or answer');
+  } finally { global.fetch = f0; keys.forEach(k => { if (env[k] === undefined) delete process.env[k]; else process.env[k] = env[k]; }); }
+  const src = fs.readFileSync(path.join(root, 'lib', 'act_ai.js'), 'utf8'), gw = fs.readFileSync(path.join(root, 'lib', 'ai.js'), 'utf8');
+  assert.ok(!/db\('(POST|PATCH|PUT|DELETE)'/.test(src), 'the AI actions write nothing (only the gateway\'s log line and the audit)');
+  assert.deepStrictEqual(gw.match(/db\('(POST|PATCH|PUT|DELETE)', '[a-z_]+/g), ["db('POST', 'hr_ai_runs"]);
+  const sql = fs.readFileSync(path.join(root, 'sql', 'hr_step19_ai.sql'), 'utf8').replace(/--.*$/gm, '');
+  assert.ok(!/\btruncate\b(?! on)|delete from|drop table|alter table public\.hr_(?!ai_runs)/i.test(sql)); assert.match(sql, /grant select, insert on public\.hr_ai_runs to service_role;/);
+  assert.ok(!/\b(question|answer|body|prompt|content)\b/.test(/create table if not exists public\.hr_ai_runs \(([\s\S]*?)\);/.exec(sql)[1]), 'no column for content');
+});
+
+test('(19-11-2026, his picture: "Front: no face was found in the picture" – "ha error sarka yeto … adchan yetey user la") a picture in poor light, or turned: its light is stretched / it is turned a quarter ONLY when no face is found; the face then found has the SAME numbers; the line of the model and the match stay as strict', async () => {
+  const F = require('../lib/face'), jpeg = require('jpeg-js');
+  // the light: the darkest 1 % → black, the brightest 1 % → white (the same for the three colours); nothing to stretch – nothing done
+  const px = (w, h, f) => { const a = new Uint8Array(w * h * 3); for (let i = 0; i < w * h; i++) { const v = f(i); a[i * 3] = v; a[i * 3 + 1] = v; a[i * 3 + 2] = v; } return a; };
+  const dim = px(100, 1, i => 10 + Math.round(i * 0.5)), up = F.lift(dim, 100, 1);
+  assert.ok(up[0] === 0 && up[up.length - 1] === 255 && up[150] > dim[150] * 2, 'a dark picture is brought out');
+  assert.strictEqual(F.lift(px(100, 1, i => Math.round(i * 2.575)), 100, 1), null, 'already from black to white: untouched');
+  assert.strictEqual(F.lift(px(10, 10, () => 40), 10, 10), null, 'one flat colour: untouched');
+  // a quarter turn: 2 × 3 → 3 × 2, and back again
+  const p = Uint8Array.from([1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6]), t1 = F.turn(p, 3, 2, 1);
+  assert.deepStrictEqual(Array.from(t1).filter((v, i) => i % 3 === 0), [4, 1, 5, 2, 6, 3]); assert.deepStrictEqual(Array.from(F.turn(t1, 2, 3, 3)), Array.from(p));
+  // the model, on a public test face (the face-api package's own demo picture – nobody of ours): found in its light, at a fifth of
+  // its light (stretched), turned (found turned back) – each with the same numbers
+  const raw = jpeg.decode(fs.readFileSync(path.join(root, 'node_modules', '@vladmandic', 'face-api', 'demo', 'sample2.jpg')));
+  const [x0, y0, w, h] = [1273, 0, 541, 830], one = Buffer.alloc(w * h * 4); for (let y = 0; y < h; y++) raw.data.copy(one, y * w * 4, ((y + y0) * raw.width + x0) * 4, ((y + y0) * raw.width + x0 + w) * 4);
+  const pic = { width: w, height: h, data: one }, enc = im => jpeg.encode(im, 80).data;
+  const dark = { width: w, height: h, data: Buffer.from(one.map((v, i) => i % 4 === 3 ? v : Math.round(v * 0.2))) };
+  const rot = { width: h, height: w, data: Buffer.alloc(w * h * 4) }; for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) one.copy(rot.data, ((x) * h + (h - 1 - y)) * 4, (y * w + x) * 4, (y * w + x) * 4 + 4);
+  const a = await F.describe(enc(pic)), b = await F.describe(enc(dark)), c = await F.describe(enc(rot));
+  assert.deepStrictEqual([a.result, a.how, b.result, b.how, c.result, c.how], ['ok', '', 'ok', 'light', 'ok', 'turned']);
+  assert.ok(F.pct(F.dist(a.descriptor, b.descriptor)) >= 99 && F.pct(F.dist(a.descriptor, c.descriptor)) >= 99, 'the same face: ' + F.pct(F.dist(a.descriptor, b.descriptor)) + ' % / ' + F.pct(F.dist(a.descriptor, c.descriptor)) + ' %');
+  assert.strictEqual((await F.describe(enc({ width: 64, height: 64, data: Buffer.alloc(64 * 64 * 4, 90) }))).result, 'noface', 'no face at all: still none');
+  const src = fs.readFileSync(path.join(root, 'lib', 'face.js'), 'utf8');
+  assert.strictEqual((src.match(/minConfidence: 0\.6/g) || []).length, 1, 'the model\'s line stays 0.6 – one place'); assert.match(src, /const HALF = 0\.6/);
+});
+
+test('(19-11-2026, asked: "site hr admin nasel ok to user asel ani tyala pages wise access deta yawa"; his answers: the Portal\'s Pages, Edit / View / No access) an HR User\'s pages: every action has its one place; the ticket brings them (this site and each HR site); No access – nothing of the page; View – only its reading; his own things, the Admin\'s / HO HR\'s, and nobody but an HR User: as before', async () => {
+  const PG = require('../lib/pages'), H = require('../api/hr'), F = require('../api/face');
+  // ---- every action of HR (api/hr.js, api/face.js) in exactly one place
+  const all = Object.keys(H.ACT).concat(Object.keys(F.ACT)), self = H.SELF.concat(F.SELF);
+  const places = a => [self.indexOf(a) > -1, PG.ANY.indexOf(a) > -1, PG.OWN.indexOf(a) > -1, !!PG.WHERE[a]].filter(Boolean).length;
+  assert.deepStrictEqual(all.filter(a => places(a) !== 1), [], 'each action: his own, every page\'s, never an HR User\'s, or one page\'s');
+  assert.deepStrictEqual(Object.keys(PG.WHERE).concat(PG.ANY, PG.OWN).filter(a => all.indexOf(a) < 0), [], 'no name of an action that is not there');
+  assert.deepStrictEqual(PG.PAGES.map(p => p.key), ['dashboard', 'employees', 'joining', 'papers', 'attendance', 'leave', 'muster', 'requests', 'approvals', 'reports', 'rulebook', 'notices', 'ai', 'places', 'phones', 'month']);
+  // ---- the ticket: an HR User's pages (only known pages, only Edit / View / None; a View-only page never Edit); not for an Admin / Super Admin / My HR
+  const pg = { employees: 'View', leave: 'None', reports: 'Edit', nonsense: 'Edit', muster: 'Delete' };
+  const site2 = { code: 'S2', name: 'Site Two', role: 'user', pages: { muster: 'None' } }, site3 = { code: 'S3', name: 'Site Three', role: 'admin', pages: { muster: 'None' } };
+  const u = await portal.verify(ticket({ pages: pg, sites: [{ code: 'S1', name: 'Site One', role: 'user', pages: pg }, site2, site3] }));
+  assert.deepStrictEqual(u.pages, { employees: 'View', leave: 'None', reports: 'View' });
+  assert.deepStrictEqual(u.sites.map(s => s.pages || null), [{ employees: 'View', leave: 'None', reports: 'View' }, { muster: 'None' }, null], 'each HR site\'s own pages – an Admin there: none');
+  assert.strictEqual((await portal.verify(ticket({ role: 'admin', pages: pg }))).pages, null, 'an HR Admin: every page');
+  assert.strictEqual((await portal.verify(ticket({ role: 'admin', super: true, pages: pg }))).pages, null, 'the Super Admin: every page');
+  assert.strictEqual((await portal.verify(ticket({ pages: {} }))).pages, null, 'nothing given: as before');
+  // ---- the door
+  const S = (role, pages) => ({ role: role, site: 'S1', email: 'a@b.test', info: { pages: pages } });
+  const no = (s, a, re) => assert.throws(() => PG.guard(s, a, self), e => { assert.strictEqual(e.status, 403); assert.match(e.message, re); return true; });
+  const user = S('user', u.pages);
+  no(user, 'leaveList', /^You do not have access to Leave in HR\. Ask the Super Admin\.$/);
+  no(user, 'leaveDecide', /^You do not have access to Leave in HR/);
+  assert.doesNotThrow(() => PG.guard(user, 'empList', self), 'View: reading');
+  no(user, 'empSave', /^You have View access only for Employees in HR\. Ask the Super Admin for Edit access\.$/);
+  no(user, 'faceReset', /View access only for Employees/);
+  assert.doesNotThrow(() => PG.guard(user, 'repRun', self));
+  for (const a of ['muster', 'daySet', 'regDecide', 'rbSave', 'invMake']) assert.doesNotThrow(() => PG.guard(user, a, self), a + ': a page not named – as before');
+  for (const a of ['myLeave', 'leaveAsk', 'punch', 'myAttend', 'teamLeaveDecide', 'faceEnrol', 'init', 'empPick', 'attSetup', 'langSet']) assert.doesNotThrow(() => PG.guard(user, a, self), a + ': his own / every page\'s');
+  for (const role of ['admin', 'super', 'self']) for (const a of ['leaveList', 'empSave']) assert.doesNotThrow(() => PG.guard(S(role, u.pages), a, self), role + ' ' + a);
+  assert.doesNotThrow(() => PG.guard(S('user', null), 'leaveDecide', self), 'no pages given: as before');
+  assert.strictEqual(PG.levelOf(user, 'cpolicies'), 'Edit'); assert.strictEqual(PG.levelOf(S('user', { rulebook: 'None' }), 'rface'), 'None', 'a part of the Rule Book goes with it');
+  assert.deepStrictEqual(PG.mine(user), { dashboard: 'Edit', employees: 'View', joining: 'Edit', papers: 'Edit', attendance: 'Edit', leave: 'None', muster: 'Edit', requests: 'Edit', approvals: 'Edit', reports: 'View', rulebook: 'Edit', notices: 'Edit', ai: 'Edit', places: 'Edit', phones: 'Edit', month: 'Edit' });
+  assert.strictEqual(PG.mine(S('admin', u.pages)), null);
+  // ---- "All sites": the other site's own pages go with its role; the menu
+  const ses = require('../lib/session');
+  const there = ses.as({ role: 'user', site: 'S1', email: 'a@b.test', info: { pages: u.pages, sites: u.sites } }, 'S2');
+  assert.deepStrictEqual(there.info.pages, { muster: 'None' }); no(there, 'daySet', /Muster/); assert.doesNotThrow(() => PG.guard(there, 'leaveList', self));
+  assert.strictEqual(ses.as({ role: 'user', site: 'S1', email: 'a@b.test', info: { pages: u.pages, sites: [{ code: 'S1', role: 'user' }, { code: 'S2', role: 'user' }] } }, 'S2').info.pages, null, 'a site without pages: as before');
+  const menu = require('../api/menu'); assert.strictEqual(typeof menu.PAGES, 'object');
+  assert.match(fs.readFileSync(path.join(root, 'api', 'hr.js'), 'utf8'), /await DR\.guard\(s, x\.action, ATT\.me\);\n[^\n]*\n  PG\.guard\(s, x\.action, SELF\);\n  try \{ send/);
+  assert.match(fs.readFileSync(path.join(root, 'api', 'face.js'), 'utf8'), /require\('\.\.\/lib\/pages'\)\.guard\(s, x\.action, SELF\);/);
+  assert.match(fs.readFileSync(path.join(root, 'api', 'menu.js'), 'utf8'), /mayOpen\(p\.who, s\.role, ho\) && PG\.mayOpen\(s, p\.key\)/);
+  assert.ok(!fs.readdirSync(path.join(root, 'sql')).some(f => /hr_step20/.test(f)), 'no database step – the pages stay on his access line in the Portal');
+});
+
+test('(19-11-2026, asked: "portal and hr madhe ask button de … kahi hi vicharle app badal sagli detail proper tyane sangawi"; his answers: guidance only, the web first) "Ask": from the guide and his role only – never the data; through HR\'s one AI door with the guide kept by the provider (its cost counted); a limit an hour; the HR office only; the page puts every word in as text', async () => {
+  const HELP = require('../lib/act_help'), PG = require('../lib/pages'), { ACT, SELF } = require('../api/hr'), AI = require('../lib/ai');
+  assert.strictEqual(ACT.helpAsk, HELP.ACT.helpAsk); assert.ok(PG.ANY.indexOf('helpAsk') > -1, 'on every page'); assert.ok(SELF.indexOf('helpAsk') < 0, '"My HR": with the app, later');
+  // the guide: the screens' own words, no person, no number of anybody
+  const G = HELP.GUIDE;
+  for (const w of ['Employees', 'Give sign-in to all', 'Rule Book → Face & requests', 'HR Admin\'s powers', 'Month verification', 'Release', 'Pages…', 'Ramesh@1234', 'outside your work place']) assert.ok(G.indexOf(w) > -1, 'the guide has: ' + w);
+  assert.ok(!/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]{2,}/.test(G) && !/\b[6-9]\d{9}\b/.test(G) && !/\b\d{4}\s?\d{4}\s?\d{4}\b/.test(G), 'no e-mail, mobile or Aadhaar in the guide');
+  assert.match(HELP.RULES, /You have NO data/); assert.match(HELP.RULES, /You change nothing/); assert.match(HELP.RULES, /language and the script of the question/);
+  // who asks: his role, his pages – nothing of the database's people
+  const user = { site: 'S1', email: 'u@rcl.test', role: 'user', info: { siteName: 'Site one', pages: { leave: 'None', employees: 'View' }, sites: [{ code: 'S1' }, { code: 'S2' }] } };
+  const w = await HELP.who(user, 'mr');
+  assert.match(w, /HR User of this site – site Site one \(S1\)/); assert.match(w, /Leave – No access/); assert.match(w, /Employees – View/); assert.match(w, /2 sites/); assert.match(w, /Marathi/);
+  await assert.rejects(() => ACT.helpAsk({ site: 'S1', email: 'e@rcl.test', role: 'self' }, { q: 'Hi' }), /HR office only/);
+  // through the AI door: the guide as one kept block; the earlier turns (at most 6) and the question as the text; the cost of what was kept
+  const env = {}, keys = ['HR_AI_ENABLED', 'HR_AI_PROVIDER', 'HR_AI_MODEL', 'ANTHROPIC_API_KEY', 'HR_AI_PRICE', 'HR_AI_MONTHLY_USD', 'HR_AI_API_BASE'];
+  keys.forEach(k => { env[k] = process.env[k]; delete process.env[k]; });
+  const f0 = global.fetch, asked = [], logged = []; let recent = 0;
+  try {
+    await assert.rejects(() => ACT.helpAsk(user, { q: 'How do I add an employee?' }), /not switched on/);
+    Object.assign(process.env, { HR_AI_ENABLED: 'true', HR_AI_PROVIDER: 'anthropic', HR_AI_MODEL: 'test-model', ANTHROPIC_API_KEY: 'k-test', HR_AI_PRICE: '{"in":3,"out":15}', HR_AI_API_BASE: 'https://ai.test' });
+    global.fetch = async (u, o) => { u = String(u);
+      if (u.startsWith('https://ai.test')) { asked.push(JSON.parse(o.body)); const j = { content: [{ type: 'text', text: '1. Open **Employees**\n2. Press **+ Add employee**' }], usage: { input_tokens: 100, cache_read_input_tokens: 10000, cache_creation_input_tokens: 0, output_tokens: 200 } }; return { ok: true, status: 200, json: async () => j, text: async () => JSON.stringify(j) }; }
+      if (o && o.method === 'POST') { logged.push(JSON.parse(o.body)[0]); return { ok: true, status: 201, text: async () => '', json: async () => null }; }
+      if (/hr_ai_runs\?select=id&purpose=eq\.help&by=eq\./.test(u)) { const rows = Array.from({ length: recent }, (_, i) => ({ id: i })); return { ok: true, status: 200, text: async () => JSON.stringify(rows), json: async () => rows }; }
+      return { ok: true, status: 200, text: async () => '[]', json: async () => [] }; };
+    const past = Array.from({ length: 9 }, (_, i) => ({ q: 'q' + i, a: 'a' + i }));
+    const r = await ACT.helpAsk(user, { q: '  employee add kasa karu  ', past: past, lang: 'mr' });
+    assert.strictEqual(r.answer, '1. Open **Employees**\n2. Press **+ Add employee**');
+    const b = asked[0]; assert.strictEqual(b.model, 'test-model'); assert.strictEqual(b.max_tokens, 1200);
+    assert.deepStrictEqual([b.system.length, b.system[0].cache_control, b.system[0].text === HELP.RULES + HELP.GUIDE], [1, { type: 'ephemeral' }, true], 'the guide: one block the provider keeps');
+    const t = b.messages[0].content[0].text; assert.match(t, /HR User of this site/); assert.match(t, /The question: employee add kasa karu$/);
+    assert.ok(t.indexOf('Q: q2') < 0 && t.indexOf('Q: q3') > -1 && t.indexOf('A: a8') > -1, 'the last 6 turns only');
+    assert.deepStrictEqual(logged.map(l => [l.purpose, l.tokens_in, l.tokens_out, l.cost_usd]), [['help', 10100, 200, 0.0063]], 'kept words at a tenth: (100×3 + 10000×0.3 + 200×15) / 1e6');
+    recent = HELP.HELP_PER_HOUR; await assert.rejects(() => ACT.helpAsk(user, { q: 'Again?' }), e => e.status === 429 && /40 questions in the last hour/.test(e.message));
+    recent = 0; await assert.rejects(() => ACT.helpAsk(user, { q: ' ' }), /Type your question/);
+  } finally { global.fetch = f0; keys.forEach(k => { if (env[k] === undefined) delete process.env[k]; else process.env[k] = env[k]; }); }
+  // the guide goes with the endpoints; the page: the button on top (not for "My HR", not inside "All sites"), every word as text
+  const v = JSON.parse(fs.readFileSync(path.join(root, 'vercel.json'), 'utf8')); assert.strictEqual(v.functions['api/{hr,me,menu,sso,logout,onboard}.js'].includeFiles, 'help/**');
+  const page = fs.readFileSync(path.join(root, 'public', 'index.html'), 'utf8'), js = fs.readFileSync(path.join(root, 'public', 'ask.js'), 'utf8');
+  assert.match(page, /<button class="top-b ask" id="ask_open"[^>]* hidden>/); assert.match(page, /<script src="ask\.js"><\/script>/); assert.match(page, /ak\.hidden = !!AS \|\| me\.user\.role === 'self' \|\| !window\.HRASK;/);
+  assert.ok(!/innerHTML|insertAdjacentHTML|outerHTML/.test(js), 'no HTML from words'); assert.match(js, /action: 'helpAsk'/); assert.match(js, /setAttribute\('data-noi18n', ''\)/);
+  for (const L of ['mr', 'hi']) { const d = JSON.parse(fs.readFileSync(path.join(root, 'public', 'i18n', L + '.json'), 'utf8')); for (const k of ['Ask', 'Send', 'Type your question…', 'How do I add an employee?', 'You asked {0} questions in the last hour – ask again a little later.']) assert.ok(d[k], L + ': ' + k); }
+});

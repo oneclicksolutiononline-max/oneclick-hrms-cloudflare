@@ -1,0 +1,108 @@
+# CLAUDE.md – RCL ERP HR module (HRMS & Attendance)
+
+Read this first, then `README.md`. The same owner and rules as the Mechanical module (`rclerp/CLAUDE.md`), the Portal, the
+Store, Engineering and Purchase; the short version:
+
+## The owner and how to talk to him
+* Sujit Mule, MD of Rachana Construction Limited (RCL).
+* **Reply in Marathi (Devanagari).** Answer first. Simple. One step at a time.
+* "adhi charcha kar" = discuss first, no code. "fkt check kr" = only check, change nothing.
+
+## Rules
+1. **Exactly what he asks, nothing extra.** He decides each step. **Each HR phase is reviewed and approved by him before it starts.**
+2. **Simple screens**, clear at a glance.
+3. **Live and business-critical:** never delete, reset or overwrite live data; no destructive SQL; no push to `main` / deploy
+   without his yes; a database change is justified and approved separately and he runs the SQL himself – **only in the HR
+   Supabase** (`rcl-hr`). Nothing of HR is ever put into the Portal's, Mechanical's, the Store's, Engineering's or Purchase's
+   database. Existing features and permissions keep working.
+4. **Evidence, not claims:** read the code, run the tests, say plainly what was not run or not verified.
+5. **Every shell / test / network command has a `timeout`.** A hang: run the one test alone, find the case, fix it. Never just re-run.
+6. **Fix a thing everywhere it is used** – also in the phone app (`rcl-mobile`): whatever is added here gets its app screen in
+   the same piece of work.
+7. **No secret, key, password or personal data in any file** (no employee's name, number, salary, photo or face data – not in a
+   test either). Keys live only in Vercel → Environment Variables and are never pasted in chat.
+8. Work arrives as a branch + pull request; he merges; Vercel deploys.
+9. **Never use or copy code of Horilla (LGPL) or any other HR product** – they are references for workflow only.
+
+## Decisions that shape this repository (12-11-2026; the plan: the Project doc `architecture/RCL_ERP_HRMS_Plan.md`)
+* **One Supabase project for HR for EVERY site** (`rcl-hr`, Mumbai): every row carries its site; this server reads and writes
+  only the sites of the person's sign-in. Row Level Security on every table with no access given – only this server reaches it.
+* **One address:** `https://oneclicksolution.online/hr` (Mechanical's `vercel.json` sends `/hr/…` here), inside Mechanical's screen.
+* **The Portal** is the one sign-in and the one place access is given (HR Admin / HR User per site). HR trusts a Portal ticket
+  only after checking its ES256 signature with `/api/jwks`, its `aud` ("hr"), `exp`, and that its `jti` is used once
+  (`hr_tickets`). The finer roles (Supervisor, Reporting Person, HR Head, Payroll) and the powers the Super Admin
+  gives are kept in HR's own database.
+* **Delete (his decision of 12-11-2026, "EMPLOYEE DELET PN KRTA YAWA"):** only an employee added by mistake, by the HR Admin / Super
+  Admin with the reason, and only while nothing hangs on him (attendance, phone, papers, KYC, people reporting to him) – `empDelete`.
+  Everybody else is **relieved** with his relieving date and stays. Attendance and papers are never deleted.
+* **An employee is not a sign-in:** the Employee Master is HR's; an employee who uses the app is linked to a Portal user.
+  Categories: Staff, Operator, Driver, Labour (not the designation). DOB and a verified e-mail (OTP by Resend) are compulsory
+  for everybody before activation.
+* **An employee's sign-in until the OTP is there (12-11-2026):** the **HR Admin of the site or the Super Admin** (not an HR
+  User) gives it from the employee's page – the PORTAL makes it (`rcl-portal/api/hrlogin.js`): a one-time password shown once, his
+  own password at the first sign-in, "My HR" only; forgotten = a new one-time password. HR keeps and sees no password. Sign-in is
+  by e-mail (by mobile number: a change of the Portal's database – not decided).
+* **A new employee's sign-in by itself (18-11-2026, asked: "employee add zala ki auto jayla hawa … te pass apan tharwla tas same first
+  pass"; his answers: the first password by the rule of 13-11-2026 – Ramesh@1234 – and in HR only):** an employee added, imported or
+  approved from a joining link by the HR Admin / Super Admin gets his "My HR" sign-in from the Portal at once (api/hrlogin, "people":
+  only a new user, nobody's password is changed); he sets his own password at the first sign-in. An HR User's new employee: the HR
+  Admin gives it from his page.
+* **Attendance (his decisions of 12-11-2026 – the later ones win):** each person punches for himself, **today only** (the
+  server's clock decides the day); GPS + a selfie with every punch (his later decision of 12-11-2026: where the site's rule asks, the face is checked
+  – step 9, `api/face.js`); **nothing outside a work place** (geofence): no punch, no request, nothing is saved; **one phone a person**
+  – only attendance is tied to it, another phone works only after the HR Admin / Super Admin released the old one; Developer
+  Options ON or a made-up location blocks **only** HR attendance / punch; a punch is never changed or deleted (the database
+  refuses it) – a correction (HR Admin / Super Admin) is a new row with the old time, the new time, the reason, who and when;
+  no network: the phone keeps the punch exactly as taken and sends it later with its own number (never twice) – it counts by
+  itself only when the phone's own clock, place and phone are in order, anything doubtful waits for the HR Admin; selfies are
+  kept 90 days (longer under a hold). The HR Admin / Super Admin make projects and work places (a point + metres, an area, along
+  the road; for whom; one by one or many at once); a real **site** stays the Portal's. Labour without a phone: the HR Admin's
+  manual entry (reason, who, when – always).
+* **Security, Phase 1 (18-11-2026 – the master prompt and his answers; the doc "RCL ERP – HR Enterprise Build"):** each company
+  has its OWN HR database (no company column in `rcl-hr`); a bank change waits for the HO HR / Super Admin (never who asked, never
+  the employee himself) and the employee is told by e-mail; nobody decides his own (the Super Admin excepted); the nightly backup
+  stays as it is; the face stays strict (no exception path); the HR office pages stay web only; two leave balances only (Paid,
+  Comp-off); WhatsApp shift reminders replace the phone-only reminder (Phase 4). New switches are OFF until he sets them in Vercel.
+* **The Employee Master, Phase 2 (18-11-2026 – the master prompt Parts 3–8, his answers: WhatsApp also for the onboarding link,
+  papers, policies and a reporting change):** 18 on the joining date (a record of before keeps its check while its dates are not
+  changed); a changed birth / joining date needs the reason; papers submitted → verified / rejected with an "asked again" newer one in
+  place and "not applicable"; reporting managers with dates (no circle, not his own); a work place given by name has dates and IN /
+  OUT; medical insurance verified; company policies apart from the Rule Book (HO HR / Super Admin publish, the person accepts); a
+  new joiner's onboarding link (only its fingerprint kept, single person, expires) approved by the HR Admin / Super Admin; activation.
+* **Attendance & compliance, Phase 3 (18-11-2026; his answer: the seven-day rule for Staff only):** the seven-day document rule is a
+  setting the Super Admin turns on (off by default); a late person's "My HR" opens only his papers / policies / record until they
+  are there or the HR Admin lets him in (reason, never his own); "My work locations" in the app; a waiting request is taken back;
+  Google Play Integrity behind `HR_INTEGRITY` (record / review – a punch is never refused for it).
+* **Notifications, Phase 4 (18-11-2026; his answer: WhatsApp for the shift reminders – four a shift, stop after sign-in – the
+  joining link, papers, policies, a reporting change; everything else app + e-mail):** one queue (never twice, retried, logged),
+  WhatsApp templates approved by Meta, a 5-minute timer from Supabase (Vercel Hobby runs a timer once a day), all OFF until
+  `HR_NOTIFY_ENABLED=true`.
+* **Payroll, Phase 5 (18-11-2026, step 18 – the master prompt Part 12):** salary structures with versions approved by another person;
+  the statutory numbers (employee and employer shares, LWF, gratuity) stay dated settings with their source and the CA's check – no
+  number in the code; Approved → Ready → Paid with the payment (Held / Rejected); full & final made → checked → approved → paid by
+  different people; the registers; the present method beside the ERP line by line for two months. The payroll of steps 11–12 is
+  unchanged for a person without a structure / LWF / TDS. HO HR / Super Admin only; office pages stay web only.
+* **Reports, Phase 6 (18-11-2026):** 25 reports with filters, Excel and PDF, each checked per role on the server (HR User: no Admin / pay
+  report, mobiles masked; HR Admin: + manual entries, phones; HO HR / Super Admin: + pay); "My team" – a reporting manager's own team,
+  read only, in the app. No SQL step.
+* **AI, Phase 7 (18-11-2026, step 19):** one provider-independent door (Vercel settings, OFF until set); every call logged with tokens and
+  cost (never the content); it reads a paper's photo, answers from the published policies, shows checks – it NEVER approves or changes
+  pay, bank details, faces or attendance.
+* **Every policy is of its own site (18-11-2026, his correction: "HO chi policy HO sathi, VTR chi VTR sathi, CTR chi CTR sathi"):** a
+  Rule Book policy and a company policy are kept for the site open at the top when they are made; lists, changes and giving show only
+  that site's – the Super Admin too; a person is asked only for his own site's. One made before for "every site" is of the sites where
+  it is in use and the site it was made on (the audit); found nowhere = every site, until it is saved again. No SQL step.
+* **Every rule in ONE place – the Rule Book (18-11-2026, asked: "ekach thikani sagle rules policy thew" – his answer: everything in the
+  Rule Book, the company policies too):** the menu shows only "Rule Book"; its row of parts: Policies · Shifts & holidays · Face &
+  requests · HR Admin's powers · Company policies. The hours, the late rules and the weekly off are the Rule Book's policies only; the
+  site's rules of before are shown there where they still count. The face is ONE setting for the whole site (Face & requests).
+* **The muster:** the late / half-day / absent rules, the shifts and the weekly off are **settings with a date** (a new
+  version; a day keeps the version of that day) – a rule left empty is not applied, no number in the code. A manual entry, a
+  correction and an approved request are NEW rows (old times, new times, reason, who, when); the punches stay. **The Super
+  Admin gives or takes each power of the HR Admin per site** (`hr_admin_powers`).
+* **"My HR" (`hrme`):** a second module key of the Portal for an employee who uses HR only for himself (role `self`): his own
+  attendance and nothing of the office's pages. The employee is found by the e-mail of his sign-in in the Employee Master.
+* **Payroll for everybody**, by category and salary type; PF, ESIC, PT, LWF, TDS and the late / absent rules are settings with
+  dates, never numbers in the code; a locked month is never recalculated; two months beside the present method first.
+* **Phases:** 1 foundation + Employee Master + import · 2 shifts, holidays, geofence, attendance, rules, muster · 3 face +
+  kiosk · 4 leave · 5 payroll · 6 self-service, reports, notifications.

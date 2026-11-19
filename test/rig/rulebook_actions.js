@@ -1,0 +1,54 @@
+// RIG ONLY (the local test database on 127.0.0.1:3140) – never a live database: timeout 90 node test/rig/rulebook_actions.js
+process.env.SUPABASE_URL = 'http://127.0.0.1:3140'; process.env.SUPABASE_SECRET_KEY = 'sb_secret_rigkey'; delete process.env.VERCEL_ENV;
+const { ACT } = require('../../lib/act_rulebook'); const { db } = require('../../lib/db');
+(async () => {
+  let n = 0, bad = 0; const ok = (c, t) => { n++; if (!c) { bad++; console.log('FAIL', t); } }, no = async (p, t) => { try { await p; ok(false, t + ' (was allowed)'); } catch (e) { ok(e.status >= 400 && e.status < 500, t + ' → ' + e.message); } };
+  const site = 'DEMOBKTX2', sup = { role: 'super', site, email: 'rig.super@rig.test' }, adm = { role: 'admin', site, email: 'rig.admin@rig.test' }, usr = { role: 'user', site, email: 'rig.user@rig.test' }, self = { role: 'self', site, email: 'x@rig.test' };
+  const tag = 'T' + Date.now();
+  const l0 = await ACT.rbList(sup); ok(l0.ready === true && l0.can.make && l0.kinds.length === 6, 'the list is ready');
+  await no(ACT.rbSave(adm, { kind: 'late', name: 'x ' + tag, valid_from: '2026-11-01', body: {}, auth: { approve: [{ role: 'ho_hr' }] } }), 'an HR Admin cannot make a policy');
+  await no(ACT.rbList(self), '"My HR" cannot open the Rule Book');
+  await no(ACT.rbSave(sup, { kind: 'late', name: 'Late ' + tag, valid_from: '2026-11-01', body: { grace_min: 15 }, auth: {} }), 'somebody must approve');
+  const p = await ACT.rbSave(sup, { kind: 'late', name: 'Late ' + tag, valid_from: '2026-11-01', body: { grace_min: 15, free: 3 }, auth: { verify: [{ role: 'site_hr' }], approve: [{ role: 'ho_hr' }] } }); ok(p.id > 0, 'a policy is made');
+  await ACT.rbSave(sup, { id: p.id, kind: 'late', name: 'Late ' + tag, valid_from: '2026-12-01', body: { grace_min: 10, free: 3 }, auth: { approve: [{ role: 'ho_hr' }] } });
+  const l1 = await ACT.rbList(adm), mine = l1.policies.find(x => x.id === p.id); ok(mine && mine.versions.length === 2 && mine.body.grace_min === 15 && mine.valid_from === '2026-11-01', 'two versions; today\'s is the first');
+  ok(l1.can.make === false && l1.can.give === true, 'the HR Admin gives, does not make');
+  // (18-11-2026, his correction) a policy is of the site it is made on – the sites the page sends are not taken
+  const site2 = site + 'B', sup2 = { role: 'super', site: site2, email: 'rig.super@rig.test' };
+  const other = await ACT.rbSave(sup2, { kind: 'late', name: 'Other site ' + tag, valid_from: '2026-11-01', sites: [site], body: {}, auth: { approve: [{ role: 'super' }] } });
+  const oth = (await ACT.rbList(sup2)).policies.find(x => x.id === other.id); ok(oth && oth.sites.join() === site2, 'made on the other site: of that site only – ' + JSON.stringify(oth && oth.sites));
+  ok(!(await ACT.rbList(adm)).policies.some(x => x.id === other.id), 'a policy of another site is not shown to this site\'s HR');
+  ok(!(await ACT.rbList(sup)).policies.some(x => x.id === other.id), '… nor to the Super Admin with this site open');
+  ok((await ACT.rbList(sup)).policies.find(x => x.id === p.id).sites.join() === site && !(await ACT.rbList(sup2)).policies.some(x => x.id === p.id), 'this site\'s policy: here, not there');
+  await no(ACT.rbDefault(adm, { kind: 'late', policy_id: other.id, valid_from: '2026-11-01' }), 'not open for this site');
+  await no(ACT.rbSave(sup, { id: other.id, kind: 'late', name: 'x', valid_from: '2026-11-01', body: {}, auth: { approve: [{ role: 'super' }] } }), 'not changed from this site');
+  await no(ACT.rbClose(sup, { id: other.id, active: false }), 'not closed from this site'); await no(ACT.rbDelete(sup, { id: other.id }), 'not deleted from this site');
+  // one made before (sites empty = "every site"): of the sites where it is in use and the site it was made on; found nowhere = every site
+  const [old] = await db('POST', 'hr_policies', [{ kind: 'late', name: 'Old ' + tag, sites: [], created_by: 'rig.super@rig.test' }], 'return=representation');
+  await db('POST', 'hr_policy_versions', [{ policy_id: old.id, valid_from: '2026-01-01', body: {}, auth: { approve: [{ role: 'super' }] }, created_by: 'rig' }], 'return=minimal');
+  const at = async (s0) => (await ACT.rbList(s0)).policies.find(x => x.id === old.id);
+  ok((await at(sup)) && (await at(sup2)) && (await at(sup)).sites.length === 0, 'found nowhere: every site, as before');
+  await db('POST', 'hr_audit', [{ site: site2, email: 'rig.super@rig.test', action: 'policy new', target: 'late #' + old.id + ' Old ' + tag }], 'return=minimal');
+  ok(!(await at(sup)) && (await at(sup2)).sites.join() === site2, 'made on the other site: shown there only');
+  await db('POST', 'hr_policy_defaults', [{ site: site, kind: 'late', policy_id: old.id, valid_from: '2026-01-01', set_by: 'rig' }], 'return=minimal');
+  ok((await at(sup)).sites.join() === [site, site2].sort().join() && (await at(adm)), 'in use on this site: shown here too');
+  await ACT.rbSave(sup, { id: old.id, kind: 'late', name: 'Old ' + tag, valid_from: '2026-12-01', body: {}, auth: { approve: [{ role: 'super' }] } });
+  ok(((await db('GET', 'hr_policies?select=sites&id=eq.' + old.id))[0].sites || []).slice().sort().join() === [site, site2].sort().join(), 'saved again: its sites are written');
+  await ACT.rbDefault(adm, { kind: 'late', policy_id: null, valid_from: '2026-01-01' });
+  await no(ACT.rbDefault(usr, { kind: 'late', policy_id: p.id, valid_from: '2026-11-01' }), 'an HR User cannot give a policy');
+  await ACT.rbDefault(adm, { kind: 'late', policy_id: p.id, valid_from: '2026-11-01' });
+  const ppl = await ACT.rbPeople(adm, { kind: 'late' }); ok(ppl.rows.length > 5 && ppl.rows.every(r => r.policy_id === p.id && r.from === 'site'), 'everybody has the site\'s policy');
+  const own = await ACT.rbSave(sup, { kind: 'late', name: 'Own ' + tag, valid_from: '2026-01-01', body: { grace_min: 5 }, auth: { approve: [{ role: 'super' }] } });
+  const two = ppl.rows.slice(0, 2).map(r => r.id); const g = await ACT.rbAssign(adm, { kind: 'late', policy_id: own.id, valid_from: '2026-11-01', employees: two, reason: 'rig' }); ok(g.given === 2, 'two people get their own');
+  const ppl2 = await ACT.rbPeople(adm, { kind: 'late' }); ok(ppl2.rows.filter(r => r.from === 'person' && r.policy_id === own.id).length === 2, 'they show their own; the rest the site\'s');
+  const of = await ACT.rbOf(adm, { id: two[0] }); ok(of.rows.find(r => r.kind === 'late').name === 'Own ' + tag && of.rows.find(r => r.kind === 'leave').policy_id === null, 'his page: his own late policy; no leave policy yet');
+  await no(ACT.rbAssign(adm, { kind: 'late', policy_id: own.id, valid_from: '2026-11-01', employees: ['00000000-0000-4000-8000-000000000000'], reason: '' }), 'a person not on this site');
+  await no(ACT.rbDelete(sup, { id: own.id }), 'a policy in use cannot be deleted');
+  await ACT.rbClose(sup, { id: own.id, active: false }); await no(ACT.rbAssign(adm, { kind: 'late', policy_id: own.id, valid_from: '2026-11-02', employees: two, reason: '' }), 'a closed policy is given to nobody new');
+  ok((await ACT.rbPeople(adm, { kind: 'late' })).rows.filter(r => r.policy_id === own.id).length === 2, 'closed: it stays where it is used');
+  await ACT.rbAssign(adm, { kind: 'late', policy_id: null, valid_from: '2026-11-01', employees: two, reason: 'back' }); ok((await ACT.rbPeople(adm, { kind: 'late' })).rows.every(r => r.from === 'site'), 'taken back: the site\'s own again');
+  await ACT.rbDelete(sup2, { id: other.id }); ok(!(await ACT.rbList(sup2)).policies.some(x => x.id === other.id), 'a never-used policy is deleted (on its own site)');
+  await ACT.rbDefault(adm, { kind: 'late', policy_id: null, valid_from: '2026-11-01' }); ok((await ACT.rbPeople(adm, { kind: 'late' })).rows.every(r => r.policy_id === null), 'the site\'s policy taken away: the rules of before');
+  await ACT.rbDayOff(adm, { day: '2026-10-31', off: false, reason: 'fifth Saturday works' }); await no(ACT.rbDayOff(adm, { day: '2026-10-31', off: true, reason: '' }), 'a reason is needed');
+  console.log((n - bad) + ' passed, ' + bad + ' failed');
+})().catch(e => { console.log('ERR', e.message); process.exit(1); });
