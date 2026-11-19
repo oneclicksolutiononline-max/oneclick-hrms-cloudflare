@@ -1788,6 +1788,9 @@
 
   window.SAAS_PORTAL = {
     open: function (containerNode) {
+      // Activate the full-viewport Owner Portal layout overrides. Without this,
+      // the HRMS login shell's centered/grid body constrains the portal to a narrow column.
+      document.body.classList.add('in-owner-portal');
       S.container = containerNode;
       S.container.textContent = 'Loading OneClick HRMS SaaS Owner Central…';
 
