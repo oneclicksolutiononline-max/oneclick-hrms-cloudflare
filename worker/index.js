@@ -233,7 +233,13 @@ async function getSession(db, request) {
     const session = await db.prepare(
       `SELECT * FROM sessions WHERE id = ? AND expires_at > datetime('now')`
     ).bind(token).first();
-    return session || null;
+    if (!session) return null;
+    // Server-side tenant suspension enforcement: active sessions are rejected immediately.
+    if (session.role !== 'super') {
+      const org = await db.prepare(`SELECT status FROM organizations WHERE id = ?`).bind(session.organization_id).first();
+      if (!org || org.status !== 'ACTIVE') return null;
+    }
+    return session;
   } catch (err) {
     console.error('Session lookup error:', err);
     return null;
@@ -374,7 +380,7 @@ export default {
              FROM users u 
              LEFT JOIN roles r ON u.role_id = r.id 
              LEFT JOIN organizations o ON u.organization_id = o.id 
-             WHERE lower(u.email) = ? AND u.status = 'ACTIVE'`
+             WHERE lower(u.email) = ? AND u.status = 'ACTIVE' AND o.status = 'ACTIVE'`
           ).bind(normEmail).first();
 
           if (!user) {
@@ -757,7 +763,18 @@ export default {
         if (updates.city !== undefined) { fields.push('city = ?'); values.push(updates.city.trim()); }
         if (updates.state !== undefined) { fields.push('state = ?'); values.push(updates.state.trim()); }
         if (updates.gst_number !== undefined) { fields.push('gst_number = ?'); values.push(updates.gst_number.trim()); }
-        if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
+        if (updates.status !== undefined) {
+          const requestedStatus = String(updates.status).toUpperCase();
+          if (!['ACTIVE', 'SUSPENDED'].includes(requestedStatus)) {
+            return json({ error: 'Client status must be ACTIVE or SUSPENDED.' }, 400, cors);
+          }
+          if (orgId === 'org_oneclick_01' && requestedStatus !== 'ACTIVE') {
+            return json({ error: 'The OneClick Solution platform organization cannot be deactivated.' }, 403, cors);
+          }
+          const targetOrg = await env.DB.prepare(`SELECT id FROM organizations WHERE id = ?`).bind(orgId).first();
+          if (!targetOrg) return json({ error: 'Client organization not found.' }, 404, cors);
+          fields.push('status = ?'); values.push(requestedStatus);
+        }
 
         if (fields.length) {
           values.push(orgId);
